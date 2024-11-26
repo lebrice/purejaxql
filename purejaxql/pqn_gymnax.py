@@ -63,11 +63,6 @@ class CustomTrainState(TrainState):
     grad_steps: int = 0
 
 
-class ExplorationState(NamedTuple):
-    obs: jax.Array
-    env_state: gymnax.EnvState
-
-
 class Config(TypedDict):
     SEED: int
     NUM_SEEDS: int
@@ -190,6 +185,7 @@ def train(
     env_params: gymnax.EnvParams,
     test_num_steps: Static[int],
 ):
+    # todo: Why at index 0? Is this assuming that we're always under `vmap` context?
     original_rng = rng[0]
     num_envs: int = config["NUM_ENVS"]
     test_num_envs: int = config["TEST_NUM_ENVS"]
@@ -250,13 +246,13 @@ def train(
         env_params=env_params,
         config=config,
         network=network,
-        test_num_envs=config["TEST_NUM_ENVS"],
+        test_num_envs=test_num_envs,
         test_num_steps=test_num_steps,
     )
 
     rng, _rng = jax.random.split(rng)
     expl_state = _vmap_reset(_rng, n_envs=num_envs, env=env, env_params=env_params)
-    expl_state = ExplorationState(*expl_state)
+    # expl_state = ExplorationState(*expl_state)
     # train
     rng, _rng = jax.random.split(rng)
     runner_state = (train_state, expl_state, test_metrics, _rng)
@@ -273,7 +269,7 @@ def train(
         env_params=env_params,
         original_rng=original_rng,
         test_num_steps=test_num_steps,
-        test_num_envs=config["TEST_NUM_ENVS"],
+        test_num_envs=test_num_envs,
     )
     runner_state, metrics = jax.lax.scan(
         update_step, init=runner_state, xs=None, length=_get_num_updates(config)
@@ -350,13 +346,15 @@ def _get_test_metrics(
 
 @jit
 def _update_step(
-    runner_state: tuple[CustomTrainState, ExplorationState, Any, chex.PRNGKey],
+    runner_state: tuple[
+        CustomTrainState, tuple[jax.Array, TEnvState], Any, chex.PRNGKey
+    ],
     _unused_input,
     network: Static[nn.Module],
     num_envs: Static[int],
     eps_scheduler: Static[Callable[[int], float]],
-    env: Static[Environment],
-    env_params: gymnax.EnvParams,
+    env: Static[Environment[TEnvState, TEnvParams]],
+    env_params: TEnvParams,
     config: Static[Config],
     original_rng: chex.PRNGKey,
     test_num_steps: Static[int],
@@ -389,7 +387,7 @@ def _update_step(
         xs=None,
         length=config["NUM_STEPS"],
     )
-    expl_state = ExplorationState(obs=obs, env_state=env_state)
+    expl_state = (obs, env_state)
     # update timesteps count
     train_state = train_state.replace(
         timesteps=train_state.timesteps + config["NUM_STEPS"] * num_envs
@@ -403,6 +401,7 @@ def _update_step(
         transitions.next_obs[-1],
         train=False,
     )
+    assert isinstance(last_q, jax.Array)
     last_q = jnp.max(last_q, axis=-1)
 
     def _get_target(
