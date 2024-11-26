@@ -15,14 +15,13 @@ import jax.numpy as jnp
 import numpy as np
 from functools import partial
 from typing import Any, Callable, Literal, NamedTuple, TypedDict
-from typing_extensions import Unpack
 import chex
 import optax
 import flax.linen as nn
 from flax.training.train_state import TrainState
 from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
 import hydra
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf
 import gymnax
 import wandb
 from gymnax.environments.environment import Environment
@@ -30,6 +29,7 @@ from xtils.jitpp import jit, Static
 
 from safetensors.flax import save_file
 from flax.traverse_util import flatten_dict, unflatten_dict
+from typing_extensions import NotRequired
 
 # Temporarily make this particular warning into an error to help future-proof our jax code.
 import jax._src.deprecations
@@ -41,38 +41,6 @@ val_before = jax._src.deprecations._registered_deprecations["tracer-hash"].accel
 jax._src.deprecations._registered_deprecations["tracer-hash"].accelerated = True
 # yield
 # jax._src.deprecations._registered_deprecations["tracer-hash"].accelerated = val_before
-
-
-class QNetwork(nn.Module):
-    action_dim: int
-    hidden_size: int = 128
-    num_layers: int = 2
-    norm_type: Literal["layer_norm", "batch_norm"] | None = "layer_norm"
-    norm_input: bool = False
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, train: bool):
-        if self.norm_input:
-            x = nn.BatchNorm(use_running_average=not train)(x)
-        else:
-            # dummy normalize input for global compatibility
-            x_dummy = nn.BatchNorm(use_running_average=not train)(x)
-
-        if self.norm_type == "layer_norm":
-            normalize = nn.LayerNorm()
-        elif self.norm_type == "batch_norm":
-            normalize = nn.BatchNorm(use_running_average=not train)
-        else:
-            normalize = lambda x: x
-
-        for _layer_index in range(self.num_layers):
-            x = nn.Dense(self.hidden_size)(x)
-            x = normalize(x)
-            x = nn.relu(x)
-
-        x = nn.Dense(self.action_dim)(x)
-
-        return x
 
 
 @chex.dataclass(frozen=True)
@@ -124,6 +92,42 @@ class Config(TypedDict):
     PROJECT: str
     WANDB_MODE: Literal["disabled", "online", "offline"]
     ALG_NAME: str
+    SAVE_PATH: NotRequired[str]
+    WANDB_LOG_ALL_SEEDS: NotRequired[bool]
+
+
+class QNetwork(nn.Module):
+    action_dim: int
+    hidden_size: int = 128
+    num_layers: int = 2
+    norm_type: Literal["layer_norm", "batch_norm"] | None = "layer_norm"
+    norm_input: bool = False
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, train: bool):
+        if self.norm_input:
+            x = nn.BatchNorm(use_running_average=not train)(x)
+        else:
+            # dummy normalize input for global compatibility
+            # (NOTE: This is probably so that the train state has batch norm running states for the input even if we're not using it?)
+            x_dummy = nn.BatchNorm(use_running_average=not train)(x)
+
+        if self.norm_type == "layer_norm":
+            normalize = nn.LayerNorm()
+        elif self.norm_type == "batch_norm":
+            normalize = nn.BatchNorm(use_running_average=not train)
+        else:
+            assert self.norm_type is None
+            normalize = lambda x: x
+
+        for _layer_index in range(self.num_layers):
+            x = nn.Dense(self.hidden_size)(x)
+            x = normalize(x)
+            x = nn.relu(x)
+
+        x = nn.Dense(self.action_dim)(x)
+
+        return x
 
 
 def _get_num_updates(config: Config) -> int:
@@ -135,11 +139,6 @@ def _get_num_updates_decay(config: Config) -> int:
 
 
 def make_train(config: Config):
-    NUM_UPDATES = _get_num_updates(config)
-    # NUM_UPDATES = NUM_UPDATES
-    NUM_UPDATES_DECAY = _get_num_updates_decay(config)
-    # config["NUM_UPDATES_DECAY"] = NUM_UPDATES_DECAY
-
     assert (config["NUM_STEPS"] * config["NUM_ENVS"]) % config[
         "NUM_MINIBATCHES"
     ] == 0, "NUM_MINIBATCHES must divide NUM_STEPS*NUM_ENVS"
@@ -147,8 +146,15 @@ def make_train(config: Config):
     env, env_params = gymnax.make(config["ENV_NAME"])
     env = FlattenObservationWrapper(env)
     env = LogWrapper(env)
+
+    # note: These are not necessary, and modifying the config in-place is not good practice IMO,
+    # but I'm just leaving it here to be 100% identical to the base implementation.
+    NUM_UPDATES = _get_num_updates(config)
+    NUM_UPDATES_DECAY = _get_num_updates_decay(config)
     TEST_NUM_STEPS: int = config.get("TEST_NUM_STEPS", env_params.max_steps_in_episode)
-    # config["TEST_NUM_STEPS"] = TEST_NUM_STEPS
+    config["NUM_UPDATES"] = NUM_UPDATES
+    config["NUM_UPDATES_DECAY"] = NUM_UPDATES_DECAY
+    config["TEST_NUM_STEPS"] = TEST_NUM_STEPS
 
     # vmap_reset = partial(get_vmap_reset, env=env, env_params=env_params)
 
@@ -280,8 +286,6 @@ def _get_test_metrics(
     env_params: gymnax.EnvParams,
     config: Static[Config],
     network: Static[nn.Module],
-    # vmap_step: Static[Callable],
-    # vmap_reset: Static[Callable],
     test_num_envs: Static[int],
     test_num_steps: Static[int],
 ):
@@ -666,7 +670,7 @@ def single_run(_config: dict[str, Any]):
 
     t0 = time.perf_counter()
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    train_vjit = jax.jit(jax.vmap(make_train(FrozenDict(config))))  # type: ignore
+    train_vjit = jax.jit(jax.vmap(make_train(config)))  # type: ignore
     outs = jax.block_until_ready(train_vjit(rngs))
     print(f"Took {time.perf_counter()-t0:.2f} seconds to complete.")
 
@@ -690,8 +694,8 @@ def single_run(_config: dict[str, Any]):
 
 
 def save_params(params: dict, filename: str | os.PathLike) -> None:
-    flattened_dict: dict[str, jax.Array] = flatten_dict(params, sep=",")
-    save_file(flattened_dict, filename)
+    flattened_dict = flatten_dict(params, sep=",")
+    save_file(flattened_dict, filename)  # type: ignore
 
 
 def load_params(filename: str | os.PathLike) -> dict:
