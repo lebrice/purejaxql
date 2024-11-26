@@ -1,19 +1,40 @@
 import operator
 from typing import Any, Mapping
-from purejaxql.pqn_gymnax import make_train
+from purejaxql.pqn_gymnax_flattened import make_train
 import jax
 import pytest
 from hydra import initialize, compose
 import numpy as np
-from purejaxql.pqn_gymnax import Config
+from purejaxql.pqn_gymnax_flattened import Config
 from pytest_regressions.ndarrays_regression import NDArraysRegressionFixture
 from flax.traverse_util import flatten_dict
 
 
 @pytest.fixture
-def config():
+def command_line_overrides(request: pytest.FixtureRequest) -> list[str]:
+    return list(getattr(request, "param", []))
+
+
+# note: default number of timesteps in the config is 5e5, making it shorter to keep tests fast.
+use_fewer_timesteps = pytest.mark.parametrize(
+    command_line_overrides.__name__,
+    [["alg.TOTAL_TIMESTEPS=100", "alg.TOTAL_TIMESTEPS_DECAY=100"]],
+    indirect=True,
+)
+
+
+@pytest.fixture
+def config(command_line_overrides: list[str]):
     with initialize(version_base="1.2", config_path="../purejaxql/config"):
-        _config = compose(config_name="config", overrides=["+alg=pqn_cartpole"])
+        overrides = ["+alg=pqn_cartpole", *command_line_overrides]
+        print(
+            "Running test with the same config as if this was passed on the command-line:"
+        )
+        print(f"python purejaxql/pqn_gymnax_flattened.py {' '.join(overrides)}")
+        _config = compose(
+            config_name="config",
+            overrides=overrides,
+        )
         config: Config = {**_config, **_config["alg"]}  # type: ignore
         yield config
 
@@ -33,6 +54,7 @@ def jit(request: pytest.FixtureRequest) -> bool:
     return getattr(request, "param")
 
 
+@use_fewer_timesteps
 def test_train_is_deterministic(
     config: Config, jit: bool, seed: int, num_seeds: int | None
 ):
@@ -52,6 +74,7 @@ def test_train_is_deterministic(
     jax.tree.map(np.testing.assert_allclose, outputs_1, outputs_2)
 
 
+@use_fewer_timesteps
 def test_train_is_reproducible(
     ndarrays_regression: NDArraysRegressionFixture,
     config: Config,
