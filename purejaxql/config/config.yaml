@@ -6,9 +6,10 @@ SEED: 0
 HYP_TUNE: False
 
 # wandb params
-WANDB_MODE: "disabled"  # set to online to activate wandb
+WANDB_MODE: "disabled" # set to online to activate wandb
 ENTITY: ""
 PROJECT: ""
+NAME: "${ALG_NAME}_${ENV_NAME}"
 alg:
   WANDB_LOG_ALL_SEEDS: False # will log all the vmapped seeds separetely
 

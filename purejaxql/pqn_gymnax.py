@@ -10,6 +10,7 @@ from pathlib import Path
 import time
 import jax
 from flax.core.frozen_dict import FrozenDict
+from gymnax.environments.environment import TEnvParams, TEnvState
 
 import jax.numpy as jnp
 import numpy as np
@@ -17,6 +18,8 @@ from functools import partial
 from typing import Any, Callable, Literal, NamedTuple, TypedDict
 import chex
 import optax
+import flax.struct
+
 import flax.linen as nn
 from flax.training.train_state import TrainState
 from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
@@ -27,6 +30,7 @@ import wandb
 from gymnax.environments.environment import Environment
 from xtils.jitpp import jit, Static
 
+import flax
 from safetensors.flax import save_file
 from flax.traverse_util import flatten_dict, unflatten_dict
 from typing_extensions import NotRequired
@@ -43,14 +47,13 @@ jax._src.deprecations._registered_deprecations["tracer-hash"].accelerated = True
 # jax._src.deprecations._registered_deprecations["tracer-hash"].accelerated = val_before
 
 
-@chex.dataclass(frozen=True)
-class Transition:
-    obs: chex.Array
-    action: chex.Array
-    reward: chex.Array
-    done: chex.Array
-    next_obs: chex.Array
-    q_val: chex.Array
+class Transition(flax.struct.PyTreeNode):
+    obs: jax.Array
+    action: jax.Array
+    reward: jax.Array
+    done: jax.Array
+    next_obs: jax.Array
+    q_val: jax.Array
 
 
 class CustomTrainState(TrainState):
@@ -87,6 +90,7 @@ class Config(TypedDict):
     MAX_GRAD_NORM: float
     LAMBDA: float
     GAMMA: float
+    REW_SCALE: NotRequired[float]
 
     ENTITY: str
     PROJECT: str
@@ -147,11 +151,11 @@ def make_train(config: Config):
     env = FlattenObservationWrapper(env)
     env = LogWrapper(env)
 
-    # note: These are not necessary, and modifying the config in-place is not good practice IMO,
-    # but I'm just leaving it here to be 100% identical to the base implementation.
     NUM_UPDATES = _get_num_updates(config)
     NUM_UPDATES_DECAY = _get_num_updates_decay(config)
     TEST_NUM_STEPS: int = config.get("TEST_NUM_STEPS", env_params.max_steps_in_episode)
+    # note: These are not necessary, and modifying the config in-place is not good practice IMO,
+    # but I'm just leaving it here to be 100% identical to the base implementation.
     config["NUM_UPDATES"] = NUM_UPDATES
     config["NUM_UPDATES_DECAY"] = NUM_UPDATES_DECAY
     config["TEST_NUM_STEPS"] = TEST_NUM_STEPS
@@ -252,7 +256,7 @@ def train(
 
     rng, _rng = jax.random.split(rng)
     expl_state = _vmap_reset(_rng, n_envs=num_envs, env=env, env_params=env_params)
-
+    expl_state = ExplorationState(*expl_state)
     # train
     rng, _rng = jax.random.split(rng)
     runner_state = (train_state, expl_state, test_metrics, _rng)
@@ -272,7 +276,7 @@ def train(
         test_num_envs=config["TEST_NUM_ENVS"],
     )
     runner_state, metrics = jax.lax.scan(
-        update_step, runner_state, xs=None, length=_get_num_updates(config)
+        update_step, init=runner_state, xs=None, length=_get_num_updates(config)
     )
 
     return {"runner_state": runner_state, "metrics": metrics}
@@ -282,8 +286,8 @@ def train(
 def _get_test_metrics(
     train_state: CustomTrainState,
     rng: chex.PRNGKey,
-    env: Static[Environment],
-    env_params: gymnax.EnvParams,
+    env: Static[Environment[TEnvState, TEnvParams]],
+    env_params: TEnvParams,
     config: Static[Config],
     network: Static[nn.Module],
     test_num_envs: Static[int],
@@ -295,7 +299,9 @@ def _get_test_metrics(
     if not test_during_training:
         return None
 
-    def _env_step(carry, _):
+    def _env_step(
+        carry: tuple[TEnvState, jax.Array, chex.PRNGKey], _: Any
+    ) -> tuple[tuple[TEnvState, jax.Array, chex.PRNGKey], dict]:
         env_state, last_obs, rng = carry
         rng, _rng = jax.random.split(rng)
         q_vals = network.apply(
@@ -311,10 +317,6 @@ def _get_test_metrics(
         action = jax.vmap(eps_greedy_exploration)(
             jax.random.split(_rng, test_num_envs), q_vals, eps
         )
-        # new_obs, new_env_state, reward, done, info = vmap_step(test_num_envs)(
-        #     _rng, env_state, action
-        # )
-
         new_obs, new_env_state, reward, done, info = _vmap_step(
             _rng,
             env_state=env_state,
@@ -323,9 +325,11 @@ def _get_test_metrics(
             env_params=env_params,
             n_envs=test_num_envs,
         )
-        return (new_env_state, new_obs, rng), info
+        assert isinstance(new_obs, jax.Array)
+        return (new_env_state, new_obs, rng), info  # type: ignore
 
     rng, _rng = jax.random.split(rng)
+    _rng: chex.PRNGKey
     init_obs, env_state = _vmap_reset(
         _rng, n_envs=test_num_envs, env=env, env_params=env_params
     )
@@ -335,23 +339,19 @@ def _get_test_metrics(
         _env_step, (env_state, init_obs, _rng), xs=None, length=test_num_steps
     )
     # return mean of done infos
-    done_infos = jax.tree.map(
-        lambda x: jnp.nanmean(
-            jnp.where(
-                infos["returned_episode"],
-                x,
-                jnp.nan,
-            )
-        ),
-        infos,
-    )
+    returned_episode: jax.Array = infos["returned_episode"]
+
+    def _get_mean_of_done_episode_infos(x: jax.Array) -> jax.Array:
+        return jnp.nanmean(jnp.where(returned_episode, x, jnp.nan))
+
+    done_infos = jax.tree.map(_get_mean_of_done_episode_infos, infos)
     return done_infos
 
 
 @jit
 def _update_step(
     runner_state: tuple[CustomTrainState, ExplorationState, Any, chex.PRNGKey],
-    unused,
+    _unused_input,
     network: Static[nn.Module],
     num_envs: Static[int],
     eps_scheduler: Static[Callable[[int], float]],
@@ -363,54 +363,33 @@ def _update_step(
     test_num_envs: Static[int],
 ):
     train_state, expl_state, test_metrics, rng = runner_state
+    _rng: chex.PRNGKey
 
     # SAMPLE PHASE
-    def _step_env(carry: tuple[jax.Array, gymnax.EnvState, chex.PRNGKey], _):
-        last_obs, env_state, rng = carry
-        rng, rng_a, rng_s = jax.random.split(rng, 3)
-        q_vals = network.apply(
-            {
-                "params": train_state.params,
-                "batch_stats": train_state.batch_stats,
-            },
-            last_obs,
-            train=False,
-        )
-        assert isinstance(q_vals, jax.Array)
-
-        # different eps for each env
-        _rngs = jax.random.split(rng_a, num_envs)
-        eps = jnp.full(num_envs, eps_scheduler(train_state.n_updates))
-        new_action = jax.vmap(eps_greedy_exploration)(_rngs, q_vals, eps)
-
-        new_obs, new_env_state, reward, new_done, info = _vmap_step(
-            rng_s,
-            env_state=env_state,
-            action=new_action,
-            n_envs=num_envs,
-            env=env,
-            env_params=env_params,
-        )
-
-        transition = Transition(
-            obs=last_obs,
-            action=new_action,
-            reward=config.get("REW_SCALE", 1) * reward,
-            done=new_done,
-            next_obs=new_obs,
-            q_val=q_vals,
-        )
-        return (new_obs, new_env_state, rng), (transition, info)
 
     # step the env
     rng, _rng = jax.random.split(rng)
-    (*expl_state, rng), (transitions, infos) = jax.lax.scan(
-        _step_env,
-        (*expl_state, _rng),
+    obs, env_state = expl_state
+    reward_scaling_coef: float = config.get("REW_SCALE", 1)
+
+    step_env = partial(
+        _train_env_step,
+        network=network,
+        train_state=train_state,
+        num_envs=num_envs,
+        eps_scheduler=eps_scheduler,
+        env=env,
+        env_params=env_params,
+        reward_scaling_coef=reward_scaling_coef,
+    )
+
+    (obs, env_state, rng), (transitions, infos) = jax.lax.scan(
+        step_env,
+        init=(obs, env_state, _rng),
         xs=None,
         length=config["NUM_STEPS"],
     )
-    expl_state: ExplorationState = tuple(expl_state)
+    expl_state = ExplorationState(obs=obs, env_state=env_state)
     # update timesteps count
     train_state = train_state.replace(
         timesteps=train_state.timesteps + config["NUM_STEPS"] * num_envs
@@ -556,30 +535,72 @@ def _update_step(
 
         jax.debug.callback(callback, metrics, original_rng)
 
-    runner_state = (train_state, tuple(expl_state), test_metrics, rng)
+    runner_state = (train_state, expl_state, test_metrics, rng)
 
     return runner_state, metrics
+
+
+def _train_env_step(  # aka '_step_env' in main.
+    carry: tuple[jax.Array, gymnax.EnvState, chex.PRNGKey],
+    _,
+    network: Static[nn.Module],
+    train_state: CustomTrainState,
+    num_envs: Static[int],
+    eps_scheduler: Static[Callable[[int], float]],
+    env: Static[Environment[TEnvState, TEnvParams]],
+    env_params: TEnvParams,
+    reward_scaling_coef: float,
+):
+    last_obs, env_state, rng = carry
+    rng, rng_a, rng_s = jax.random.split(rng, 3)
+    q_vals = network.apply(
+        {
+            "params": train_state.params,
+            "batch_stats": train_state.batch_stats,
+        },
+        last_obs,
+        train=False,
+    )
+    assert isinstance(q_vals, jax.Array)
+
+    # different eps for each env
+    _rngs = jax.random.split(rng_a, num_envs)
+    eps = jnp.full(num_envs, eps_scheduler(train_state.n_updates))
+    new_action = jax.vmap(eps_greedy_exploration)(_rngs, q_vals, eps)
+
+    new_obs, new_env_state, reward, new_done, info = _vmap_step(
+        rng_s,
+        env_state=env_state,
+        action=new_action,
+        n_envs=num_envs,
+        env=env,
+        env_params=env_params,
+    )
+
+    transition = Transition(
+        obs=last_obs,
+        action=new_action,
+        reward=reward_scaling_coef * reward,
+        # reward=config.get("REW_SCALE", 1) * reward,
+        done=new_done,
+        next_obs=new_obs,
+        q_val=q_vals,
+    )
+    assert isinstance(new_obs, jax.Array)
+    rng: chex.PRNGKey
+    return (new_obs, new_env_state, rng), (transition, info)
 
 
 @jit
 def _vmap_reset(
     rng: chex.PRNGKey,
     n_envs: Static[int],
-    env: Static[Environment],
-    env_params: gymnax.EnvParams,
-) -> Callable[
-    [chex.PRNGKey, gymnax.EnvParams | None], tuple[chex.Array, gymnax.EnvState]
-]:
+    env: Static[Environment[TEnvState, TEnvParams]],
+    env_params: TEnvParams,
+) -> tuple[jax.Array, TEnvState]:
     return jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(rng, n_envs), env_params
     )
-
-
-@jit
-def get_vmap_reset(
-    n_envs: Static[int], env: Static[Environment], env_params: gymnax.EnvParams
-):
-    return partial(_vmap_reset, n_envs=n_envs, env=env, env_params=env_params)
 
 
 @jit
@@ -588,12 +609,9 @@ def _vmap_step(
     env_state: gymnax.EnvState,
     action: jax.Array,
     n_envs: Static[int],
-    env: Static[Environment],
-    env_params: gymnax.EnvParams,
-) -> Callable[
-    [chex.PRNGKey, gymnax.EnvState, jax.Array, gymnax.EnvParams | None],
-    tuple[chex.Array, gymnax.EnvState, jax.Array, jax.Array, dict],
-]:
+    env: Static[Environment[TEnvState, TEnvParams]],
+    env_params: TEnvParams,
+) -> tuple[jax.Array, TEnvState, jax.Array, jax.Array, dict]:
     return jax.vmap(env.step, in_axes=(0, 0, 0, None))(
         jax.random.split(rng, n_envs), env_state, action, env_params
     )
@@ -661,9 +679,10 @@ def single_run(_config: dict[str, Any]):
             env_name.upper(),
             f"jax_{jax.__version__}",
         ],
-        name=f'{config["ALG_NAME"]}_{config["ENV_NAME"]}',
-        config=dict(config),
+        name=config.get("NAME", f'{config["ALG_NAME"]}_{config["ENV_NAME"]}'),
+        config=config,  # type: ignore
         mode=config["WANDB_MODE"],
+        save_code=True,
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
@@ -683,7 +702,6 @@ def single_run(_config: dict[str, Any]):
             dict(config),
             save_dir / f'{alg_name}_{env_name}_seed{config["SEED"]}_config.yaml',
         )
-
         for i, rng in enumerate(rngs):
             params = jax.tree.map(operator.itemgetter(i), model_state.params)
             save_path = (
@@ -691,6 +709,7 @@ def single_run(_config: dict[str, Any]):
                 / f'{alg_name}_{env_name}_seed{config["SEED"]}_vmap{i}.safetensors'
             )
             save_params(params, save_path)
+    return outs
 
 
 def save_params(params: dict, filename: str | os.PathLike) -> None:
