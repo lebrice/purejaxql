@@ -1,4 +1,5 @@
-"""https://wandb.ai/lebrice/uncategorized/overview
+"""
+
 This script is compatible with the gymnax environments: https://github.com/RobertTLange/gymnax/tree/main
 It uses by default the FlattenObservationWrapper, meaning that the observations are flattened before being fed to the network.
 """
@@ -9,7 +10,7 @@ import os
 import time
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Generic, Literal, TypedDict
+from typing import Any, Callable, Generic, Literal
 
 import chex
 import flax
@@ -19,28 +20,24 @@ import gymnax
 import hydra
 import jax
 
-import jax._src.deprecations
 import jax.numpy as jnp
 import numpy as np
 import optax
-from typing_extensions import TypedDict, Generic
+from typing_extensions import TypedDict
 
 from flax.core.frozen_dict import FrozenDict
-from flax.training.train_state import TrainState
-from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.typing import FrozenVariableDict
 from gymnax.environments.environment import Environment, TEnvParams, TEnvState
 from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
 from omegaconf import OmegaConf
-from safetensors.flax import load_file, save_file
 from typing_extensions import NotRequired
 from xtils.jitpp import Static, jit
 
 import wandb
-from purejaxql.pqn_gymnax import CustomTrainState, QNetwork
 
-# Temporarily make this particular warning into an error to help future-proof our jax code.
-jax._src.deprecations._registered_deprecations["tracer-hash"].accelerated = True
+# Reuse the network and train state classes from the original.
+from purejaxql.pqn_gymnax import CustomTrainState, QNetwork
+from purejaxql.utils import save_params
 
 
 class Transition(flax.struct.PyTreeNode):
@@ -371,10 +368,10 @@ def _update_step(
     }
     metrics.update({k: v.mean() for k, v in infos.items()})
     if config.get("TEST_DURING_TRAINING", False):
-        NUM_UPDATES = _get_num_updates(config)
+        num_updates = _get_num_updates(config)
         rng, _rng = jax.random.split(rng)
         test_metrics = jax.lax.cond(
-            train_state.n_updates % int(NUM_UPDATES * config["TEST_INTERVAL"]) == 0,
+            train_state.n_updates % int(num_updates * config["TEST_INTERVAL"]) == 0,
             lambda _: _get_test_metrics(
                 train_state,
                 _rng,
@@ -672,16 +669,6 @@ def single_run(_config: dict[str, Any]):
             )
             save_params(params, save_path)
     return outs
-
-
-def save_params(params: dict, filename: str | os.PathLike) -> None:
-    flattened_dict = flatten_dict(params, sep=",")
-    save_file(flattened_dict, filename)  # type: ignore
-
-
-def load_params(filename: str | os.PathLike) -> dict:
-    flattened_dict = load_file(filename)
-    return unflatten_dict(flattened_dict, sep=",")
 
 
 def tune(_default_config):
