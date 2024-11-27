@@ -9,8 +9,7 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
-from functools import partial
-from typing import Any
+from typing import Any, Literal
 
 from safetensors.flax import save_file, load_file
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -30,7 +29,7 @@ class QNetwork(nn.Module):
     action_dim: int
     hidden_size: int = 128
     num_layers: int = 2
-    norm_type: str = "layer_norm"
+    norm_type: Literal["layer_norm", "batch_norm"] | None = "layer_norm"
     norm_input: bool = False
 
     @nn.compact

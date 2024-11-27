@@ -6,6 +6,7 @@ import copy
 import os
 import time
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, Generic
 
 import chex
@@ -907,7 +908,7 @@ def single_run(_config: dict):
             f"jax_{jax.__version__}",
         ],
         name=f'{config["ALG_NAME"]}_{config["ENV_NAME"]}',
-        config=config,
+        config=dict(config),
         mode=config["WANDB_MODE"],
     )
 
@@ -919,9 +920,9 @@ def single_run(_config: dict):
     outs = jax.block_until_ready(train_vjit(rngs))
     print(f"Took {time.time()-t0} seconds to complete.")
 
-    if config.get("SAVE_PATH", None) is not None:
+    if (save_path := config.get("SAVE_PATH")) is not None:
         model_state = outs["runner_state"][0]
-        save_dir = os.path.join(config["SAVE_PATH"], env_name)
+        save_dir = Path(save_path) / env_name
         os.makedirs(save_dir, exist_ok=True)
         OmegaConf.save(
             config,

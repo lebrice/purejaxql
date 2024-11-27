@@ -629,7 +629,7 @@ def eps_greedy_exploration(rng: chex.PRNGKey, q_vals: jax.Array, eps: jax.Array)
     return chosen_actions
 
 
-def single_run(_config: dict[str, Any]):
+def single_run(_config: dict):
     config: Config = {**_config, **_config["alg"]}  # type: ignore
 
     alg_name: str = config.get("ALG_NAME", "pqn")
@@ -657,10 +657,10 @@ def single_run(_config: dict[str, Any]):
     outs = jax.block_until_ready(train_vjit(rngs))
     print(f"Took {time.perf_counter()-t0:.2f} seconds to complete.")
 
-    if config.get("SAVE_PATH", None) is not None:
+    if (save_path := config.get("SAVE_PATH")) is not None:
         # todo: this import is failing:
         model_state = outs["runner_state"][0]
-        save_dir = Path(config["SAVE_PATH"]) / env_name
+        save_dir = Path(save_path) / env_name
         os.makedirs(save_dir, exist_ok=True)
         OmegaConf.save(
             dict(config),
@@ -729,6 +729,7 @@ def tune(_default_config):
 def main(config):
     config = OmegaConf.to_container(config)
     print("Config:\n", OmegaConf.to_yaml(config))
+    assert isinstance(config, dict)
     if config["HYP_TUNE"]:
         tune(config)
     else:
