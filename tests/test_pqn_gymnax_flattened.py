@@ -1,5 +1,5 @@
 import operator
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, TypeVar
 from purejaxql.pqn_gymnax_flattened import make_train
 import jax
 import pytest
@@ -8,6 +8,7 @@ import numpy as np
 from purejaxql.pqn_gymnax_flattened import Config
 from pytest_regressions.ndarrays_regression import NDArraysRegressionFixture
 from flax.traverse_util import flatten_dict
+from purejaxql.pqn_gymnax import make_train as original_make_train
 
 
 @pytest.fixture
@@ -16,11 +17,12 @@ def command_line_overrides(request: pytest.FixtureRequest) -> list[str]:
 
 
 # note: default number of timesteps in the config is 5e5, making it shorter to keep tests fast.
-use_fewer_timesteps = pytest.mark.parametrize(
-    command_line_overrides.__name__,
-    [["alg.TOTAL_TIMESTEPS=100", "alg.TOTAL_TIMESTEPS_DECAY=100"]],
-    indirect=True,
-)
+def use_fewer_timesteps(n_steps: int = 100):
+    return pytest.mark.parametrize(
+        command_line_overrides.__name__,
+        [[f"alg.TOTAL_TIMESTEPS={n_steps}", f"alg.TOTAL_TIMESTEPS_DECAY={n_steps}"]],
+        indirect=True,
+    )
 
 
 @pytest.fixture
@@ -54,7 +56,64 @@ def jit(request: pytest.FixtureRequest) -> bool:
     return getattr(request, "param")
 
 
-@use_fewer_timesteps
+def assert_results_not_empty(results: Mapping[str, Any]) -> None:
+    assert results["metrics"]
+    shapes = jax.tree.map(np.shape, results["metrics"])
+    assert all(v and v != (0,) for v in jax.tree.leaves(shapes)), shapes
+
+
+def test_results_are_the_same(
+    config: Config, jit: bool, seed: int, num_seeds: int | None
+):
+    # Interesting that this test fails when `jit=False`!
+
+    original_train_fn = original_make_train(config)
+    flattened_train_fn = make_train(config)
+
+    if num_seeds is not None:
+        original_train_fn = jax.vmap(original_train_fn)
+        flattened_train_fn = jax.vmap(flattened_train_fn)
+
+    if jit:
+        original_train_fn = jax.jit(original_train_fn)
+        flattened_train_fn = jax.jit(flattened_train_fn)
+
+    rng = jax.random.PRNGKey(seed)
+    if num_seeds is not None:
+        rng = jax.random.split(rng, num_seeds)
+
+    original_results = original_train_fn(rng)
+    flattened_results = flattened_train_fn(rng)
+
+    # NOTE: results := (train_state, expl_state, test_metrics, _rng)
+    # The `train_state` seems like it's not directly comparable with `np.testing.assert_allclose` for some reason.
+    jax.tree.map(
+        np.testing.assert_allclose,
+        original_results["runner_state"][0].params,
+        flattened_results["runner_state"][0].params,
+    )
+    jax.tree.map(
+        np.testing.assert_allclose,
+        original_results["runner_state"][0].batch_stats,
+        flattened_results["runner_state"][0].batch_stats,
+    )
+
+    # The `expl_state`, `test_metrics` and `_rng` are exactly the same!
+    jax.tree.map(
+        np.testing.assert_allclose,
+        original_results["runner_state"][1:],
+        flattened_results["runner_state"][1:],
+    )
+    assert_results_not_empty(original_results)
+    assert_results_not_empty(flattened_results)
+    jax.tree.map(
+        np.testing.assert_allclose,
+        original_results["metrics"],
+        flattened_results["metrics"],
+    )
+
+
+@use_fewer_timesteps(100)
 def test_train_is_deterministic(
     config: Config, jit: bool, seed: int, num_seeds: int | None
 ):
@@ -70,11 +129,15 @@ def test_train_is_deterministic(
 
     outputs_1 = train_fn(rng)
     outputs_2 = train_fn(rng)
+
+    shapes = jax.tree.map(np.shape, outputs_1["metrics"])
+    assert all(v and v != (0,) for v in jax.tree.leaves(shapes)), shapes
+
     jax.block_until_ready((outputs_1, outputs_2))
     jax.tree.map(np.testing.assert_allclose, outputs_1, outputs_2)
 
 
-@use_fewer_timesteps
+@use_fewer_timesteps(100)
 def test_train_is_reproducible(
     ndarrays_regression: NDArraysRegressionFixture,
     config: Config,

@@ -6,45 +6,41 @@ It uses by default the FlattenObservationWrapper, meaning that the observations 
 import copy
 import operator
 import os
-from pathlib import Path
 import time
+from functools import partial
+from pathlib import Path
+from typing import Any, Callable, Generic, Literal, TypedDict
+
+import chex
+import flax
+import flax.linen as nn
+import flax.struct
+import gymnax
+import hydra
 import jax
-from flax.core.frozen_dict import FrozenDict
-from gymnax.environments.environment import TEnvParams, TEnvState
-from flax.typing import FrozenVariableDict
+
+import jax._src.deprecations
 import jax.numpy as jnp
 import numpy as np
-from functools import partial
-from typing import Any, Callable, Literal, NamedTuple, TypedDict
-import chex
 import optax
-import flax.struct
+from typing_extensions import TypedDict, Generic
 
-import flax.linen as nn
+from flax.core.frozen_dict import FrozenDict
 from flax.training.train_state import TrainState
-from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
-import hydra
-from omegaconf import OmegaConf
-import gymnax
-import wandb
-from gymnax.environments.environment import Environment
-from xtils.jitpp import jit, Static
-
-import flax
-from safetensors.flax import save_file
 from flax.traverse_util import flatten_dict, unflatten_dict
+from flax.typing import FrozenVariableDict
+from gymnax.environments.environment import Environment, TEnvParams, TEnvState
+from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
+from omegaconf import OmegaConf
+from safetensors.flax import load_file, save_file
 from typing_extensions import NotRequired
+from xtils.jitpp import Static, jit
+
+import wandb
+from purejaxql.pqn_gymnax import CustomTrainState, QNetwork
 
 # Temporarily make this particular warning into an error to help future-proof our jax code.
-import jax._src.deprecations
-
-from safetensors.flax import save_file, load_file
-
-
-val_before = jax._src.deprecations._registered_deprecations["tracer-hash"].accelerated
 jax._src.deprecations._registered_deprecations["tracer-hash"].accelerated = True
-# yield
-# jax._src.deprecations._registered_deprecations["tracer-hash"].accelerated = val_before
 
 
 class Transition(flax.struct.PyTreeNode):
@@ -54,13 +50,6 @@ class Transition(flax.struct.PyTreeNode):
     done: jax.Array
     next_obs: jax.Array
     q_val: jax.Array
-
-
-class CustomTrainState(TrainState):
-    batch_stats: Any
-    timesteps: int = 0
-    n_updates: int = 0
-    grad_steps: int = 0
 
 
 class Config(TypedDict):
@@ -98,40 +87,6 @@ class Config(TypedDict):
     WANDB_LOG_ALL_SEEDS: NotRequired[bool]
 
 
-class QNetwork(nn.Module):
-    action_dim: int
-    hidden_size: int = 128
-    num_layers: int = 2
-    norm_type: Literal["layer_norm", "batch_norm"] | None = "layer_norm"
-    norm_input: bool = False
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, train: bool):
-        if self.norm_input:
-            x = nn.BatchNorm(use_running_average=not train)(x)
-        else:
-            # dummy normalize input for global compatibility
-            # (NOTE: This is probably so that the train state has batch norm running states for the input even if we're not using it?)
-            x_dummy = nn.BatchNorm(use_running_average=not train)(x)
-
-        if self.norm_type == "layer_norm":
-            normalize = nn.LayerNorm()
-        elif self.norm_type == "batch_norm":
-            normalize = nn.BatchNorm(use_running_average=not train)
-        else:
-            assert self.norm_type is None
-            normalize = lambda x: x
-
-        for _layer_index in range(self.num_layers):
-            x = nn.Dense(self.hidden_size)(x)
-            x = normalize(x)
-            x = nn.relu(x)
-
-        x = nn.Dense(self.action_dim)(x)
-
-        return x
-
-
 def _get_num_updates(config: Config) -> int:
     return config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
 
@@ -158,17 +113,6 @@ def make_train(config: Config):
     config["NUM_UPDATES_DECAY"] = NUM_UPDATES_DECAY
     config["TEST_NUM_STEPS"] = TEST_NUM_STEPS
 
-    # vmap_reset = partial(get_vmap_reset, env=env, env_params=env_params)
-
-    # vmap_reset = lambda n_envs: lambda rng: jax.vmap(env.reset, in_axes=(0, None))(
-    #     jax.random.split(rng, n_envs), env_params
-    # )
-
-    # vmap_step = partial(get_vmap_step, env=env, env_params=env_params)
-    # vmap_step = lambda n_envs: lambda rng, env_state, action: jax.vmap(
-    #     env.step, in_axes=(0, 0, 0, None)
-    # )(jax.random.split(rng, n_envs), env_state, action, env_params)
-
     # epsilon-greedy exploration
 
     return partial(
@@ -180,6 +124,13 @@ def make_train(config: Config):
     )
 
 
+class Results(TypedDict, Generic[TEnvState]):
+    runner_state: tuple[
+        CustomTrainState, tuple[jax.Array, TEnvState], Any, chex.PRNGKey
+    ]
+    metrics: dict[str, jax.Array]
+
+
 @jit
 def train(
     rng: chex.PRNGKey,
@@ -187,7 +138,7 @@ def train(
     env: Static[Environment[TEnvState, TEnvParams]],
     env_params: TEnvParams,
     test_num_steps: Static[int],
-):
+) -> Results[TEnvState]:
     # todo: Why at index 0? Is this assuming that we're always under `vmap` context?
     original_rng = rng[0]
     num_envs: int = config["NUM_ENVS"]
@@ -245,8 +196,6 @@ def train(
         network=network,
         num_envs=num_envs,
         eps_scheduler=eps_scheduler,
-        # vmap_step=partial(_vmap_step, env=env, env_params=env_params),
-        # vmap_reset=partial(_vmap_reset, env=env, env_params=env_params),
         config=config,
         env=env,
         env_params=env_params,
@@ -389,27 +338,10 @@ def _update_step(
     assert isinstance(last_q, jax.Array)
     last_q = jnp.max(last_q, axis=-1)
 
-    def _get_target(
-        lambda_returns_and_next_q: tuple[jax.Array, jax.Array], transition: Transition
-    ):
-        lambda_returns, next_q = lambda_returns_and_next_q
-        target_bootstrap = (
-            transition.reward + config["GAMMA"] * (1 - transition.done) * next_q
-        )
-        delta = lambda_returns - next_q
-        lambda_returns = target_bootstrap + config["GAMMA"] * config["LAMBDA"] * delta
-        # note: what about?
-        # lambda_returns = jnp.where(transition.done, transition.reward, lambda_returns)
-        lambda_returns = (
-            1 - transition.done
-        ) * lambda_returns + transition.done * transition.reward
-        next_q = jnp.max(transition.q_val, axis=-1)
-        return (lambda_returns, next_q), lambda_returns
-
     last_q = last_q * (1 - transitions.done[-1])
     lambda_returns = transitions.reward[-1] + config["GAMMA"] * last_q
     _, targets = jax.lax.scan(
-        _get_target,
+        partial(_get_target, gamma=config["GAMMA"], lambda_=config["LAMBDA"]),
         (lambda_returns, last_q),
         jax.tree.map(lambda x: x[:-1], transitions),
         reverse=True,
@@ -476,6 +408,26 @@ def _update_step(
 
 
 @jit
+def _get_target(
+    lambda_returns_and_next_q: tuple[jax.Array, jax.Array],
+    transition: Transition,
+    gamma: float,
+    lambda_: float,
+):
+    lambda_returns, next_q = lambda_returns_and_next_q
+    target_bootstrap = transition.reward + gamma * (1 - transition.done) * next_q
+    delta = lambda_returns - next_q
+    lambda_returns = target_bootstrap + gamma * lambda_ * delta
+    # note: what about?
+    # lambda_returns = jnp.where(transition.done, transition.reward, lambda_returns)
+    lambda_returns = (
+        1 - transition.done
+    ) * lambda_returns + transition.done * transition.reward
+    next_q = jnp.max(transition.q_val, axis=-1)
+    return (lambda_returns, next_q), lambda_returns
+
+
+@jit
 def learn_epoch(
     carry: tuple[CustomTrainState, chex.PRNGKey],
     _,
@@ -486,66 +438,74 @@ def learn_epoch(
 ):
     train_state, rng = carry
 
-    def _learn_phase(
-        carry: tuple[CustomTrainState, chex.PRNGKey],
-        minibatch_and_target: tuple[Transition, jax.Array],
-    ):
-        train_state, rng = carry
-        minibatch, target = minibatch_and_target
-
-        def _loss_fn(params: FrozenVariableDict):
-            q_vals, updates = network.apply(
-                {"params": params, "batch_stats": train_state.batch_stats},
-                minibatch.obs,
-                train=True,
-                mutable=["batch_stats"],
-            )  # (batch_size*2, num_actions)
-
-            chosen_action_qvals = jnp.take_along_axis(
-                q_vals,
-                jnp.expand_dims(minibatch.action, axis=-1),
-                axis=-1,
-            ).squeeze(axis=-1)
-
-            loss = 0.5 * jnp.square(chosen_action_qvals - target).mean()
-
-            return loss, (updates, chosen_action_qvals)
-
-        (loss, (updates, qvals)), grads = jax.value_and_grad(_loss_fn, has_aux=True)(
-            train_state.params
-        )
-        train_state = train_state.apply_gradients(grads=grads)
-        train_state = train_state.replace(
-            grad_steps=train_state.grad_steps + 1,
-            batch_stats=updates["batch_stats"],
-        )
-        return (train_state, rng), (loss, qvals)
-
-    def preprocess_transition(x: jax.Array, rng: chex.PRNGKey):
-        x = x.reshape(-1, *x.shape[2:])  # num_steps*num_envs (batch_size), ...
-        x = jax.random.permutation(rng, x)  # shuffle the transitions
-        x = x.reshape(
-            # config["NUM_MINIBATCHES"], -1, *x.shape[1:]
-            num_minibatches,
-            -1,
-            *x.shape[1:],
-        )  # num_mini_updates, batch_size/num_mini_updates, ...
-        return x
-
     rng, _rng = jax.random.split(rng)
     # num_actors*num_envs (batch_size), ...
-    minibatches: Transition = jax.tree.map(
-        partial(preprocess_transition, rng=_rng), transitions
+    preprocess_fn = partial(
+        preprocess_transition, rng=_rng, num_minibatches=num_minibatches
     )
-    targets: jax.Array = jax.tree.map(
-        partial(preprocess_transition, rng=_rng), lambda_targets
-    )
+    minibatches: Transition = jax.tree.map(preprocess_fn, transitions)
+    targets: jax.Array = jax.tree.map(preprocess_fn, lambda_targets)
 
     rng, _rng = jax.random.split(rng)
     (train_state, rng), (loss, qvals) = jax.lax.scan(
-        _learn_phase, (train_state, rng), (minibatches, targets)
+        partial(_learn_phase, network=network),
+        (train_state, rng),
+        (minibatches, targets),
     )
 
+    return (train_state, rng), (loss, qvals)
+
+
+@jit
+def preprocess_transition(
+    x: jax.Array, rng: chex.PRNGKey, num_minibatches: Static[int]
+):
+    x = x.reshape(-1, *x.shape[2:])  # num_steps*num_envs (batch_size), ...
+    x = jax.random.permutation(rng, x)  # shuffle the transitions
+    x = x.reshape(
+        # config["NUM_MINIBATCHES"], -1, *x.shape[1:]
+        num_minibatches,
+        -1,
+        *x.shape[1:],
+    )  # num_mini_updates, batch_size/num_mini_updates, ...
+    return x
+
+
+@jit
+def _learn_phase(
+    carry: tuple[CustomTrainState, chex.PRNGKey],
+    minibatch_and_target: tuple[Transition, jax.Array],
+    network: Static[nn.Module],
+):
+    train_state, rng = carry
+    minibatch, target = minibatch_and_target
+
+    def _loss_fn(params: FrozenVariableDict):
+        q_vals, updates = network.apply(
+            {"params": params, "batch_stats": train_state.batch_stats},
+            minibatch.obs,
+            train=True,
+            mutable=["batch_stats"],
+        )  # (batch_size*2, num_actions)
+
+        chosen_action_qvals = jnp.take_along_axis(
+            q_vals,
+            jnp.expand_dims(minibatch.action, axis=-1),
+            axis=-1,
+        ).squeeze(axis=-1)
+
+        loss = 0.5 * jnp.square(chosen_action_qvals - target).mean()
+
+        return loss, (updates, chosen_action_qvals)
+
+    (loss, (updates, qvals)), grads = jax.value_and_grad(_loss_fn, has_aux=True)(
+        train_state.params
+    )
+    train_state = train_state.apply_gradients(grads=grads)
+    train_state = train_state.replace(
+        grad_steps=train_state.grad_steps + 1,
+        batch_stats=updates["batch_stats"],
+    )
     return (train_state, rng), (loss, qvals)
 
 
@@ -624,13 +584,6 @@ def _vmap_step(
     return jax.vmap(env.step, in_axes=(0, 0, 0, None))(
         jax.random.split(rng, n_envs), env_state, action, env_params
     )
-
-
-@jit
-def get_vmap_step(
-    n_envs: Static[int], env: Static[Environment], env_params: gymnax.EnvParams
-):
-    return partial(_vmap_step, n_envs=n_envs, env=env, env_params=env_params)
 
 
 @jit

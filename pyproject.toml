@@ -25,7 +25,4 @@ build-backend = "hatchling.build"
 packages = ["purejaxql"]
 
 [dependency-groups]
-dev = [
-    "pytest-regressions>=2.5.0",
-    "pytest>=8.3.3",
-]
+dev = ["pytest-regressions>=2.5.0", "pytest>=8.3.3"]
