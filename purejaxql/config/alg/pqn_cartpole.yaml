@@ -28,5 +28,3 @@ TEST_DURING_TRAINING: True
 TEST_INTERVAL: 0.05 # in terms of total updates
 TEST_NUM_ENVS: 128
 EPS_TEST: 0. # 0 for greedy policy
-
-NAME: "${.ALG_NAME}_${.ENV_NAME}"

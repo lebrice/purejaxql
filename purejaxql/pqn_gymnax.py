@@ -433,7 +433,7 @@ def single_run(config):
             env_name.upper(),
             f"jax_{jax.__version__}",
         ],
-        name=f'{config["ALG_NAME"]}_{config["ENV_NAME"]}',
+        name=config.get("NAME", f'{config["ALG_NAME"]}_{config["ENV_NAME"]}'),
         config=config,
         mode=config["WANDB_MODE"],
     )
