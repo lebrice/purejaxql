@@ -294,6 +294,7 @@ def train(
             original_rng=original_rng,
             num_envs=config["NUM_ENVS"],
             num_steps=config["NUM_STEPS"],
+            num_updates=num_updates,
             test_num_steps=test_num_steps,
         ),
         init=runner_state,
@@ -476,6 +477,7 @@ def _update_step(
     num_envs: Static[int],
     num_steps: Static[int],
     test_num_steps: Static[int],
+    num_updates: Static[int],
 ):
     (
         train_state,
@@ -543,8 +545,7 @@ def _update_step(
     if config.get("TEST_DURING_TRAINING", False):
         rng, _rng = jax.random.split(rng)
         test_metrics = jax.lax.cond(
-            train_state.n_updates % int(config["NUM_UPDATES"] * config["TEST_INTERVAL"])
-            == 0,
+            train_state.n_updates % int(num_updates * config["TEST_INTERVAL"]) == 0,
             lambda _: get_test_metrics(
                 train_state,
                 _rng,
@@ -571,7 +572,7 @@ def _update_step(
 
         jax.debug.callback(callback, metrics, original_rng)
 
-    runner_state = (
+    new_runner_state = (
         train_state,
         memory_transitions,
         expl_state,
@@ -579,7 +580,7 @@ def _update_step(
         rng,
     )
 
-    return runner_state, metrics
+    return new_runner_state, metrics
 
 
 @jit
@@ -891,8 +892,8 @@ def _vmap_step(
     )
 
 
-def single_run(config):
-    config = {**config, **config["alg"]}
+def single_run(_config: dict):
+    config: Config = {**_config, **_config["alg"]}  # type: ignore
 
     alg_name = config.get("ALG_NAME", "pqn_rnn")
     env_name = config["ENV_NAME"]
@@ -938,10 +939,10 @@ def single_run(config):
             save_params(params, save_path)
 
 
-def tune(default_config):
+def tune(_default_config):
     """Hyperparameter sweep with wandb."""
 
-    default_config = {**default_config, **default_config["alg"]}
+    default_config: Config = {**_default_config, **_default_config["alg"]}  # type: ignore
     alg_name = default_config.get("ALG_NAME", "pqn_rnn")
     env_name = default_config["ENV_NAME"]
 
@@ -988,6 +989,7 @@ def tune(default_config):
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def main(config):
     config = OmegaConf.to_container(config)
+    assert isinstance(config, dict)
     print("Config:\n", OmegaConf.to_yaml(config))
     if config["HYP_TUNE"]:
         tune(config)

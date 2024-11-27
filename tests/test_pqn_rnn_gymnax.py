@@ -3,7 +3,7 @@ import purejaxql.pqn_rnn_gymnax
 import purejaxql.pqn_rnn_gymnax_flat
 
 from .conftest import (
-    BaseTests,
+    AlgoTests,
     use_alg_configs,
     use_fewer_timesteps,
 )
@@ -18,6 +18,8 @@ from .conftest import (
     num_envs=32,
     total_timesteps=32 * 64 * 2,
 )
-class TestFlattenedPqnRNNGymnax(BaseTests):
-    original_make_train = purejaxql.pqn_rnn_gymnax.make_train
-    new_make_train = purejaxql.pqn_rnn_gymnax_flat.make_train
+class TestFlattenedPqnRNNGymnax(
+    AlgoTests,
+):  # ComparisonTests):
+    # original_make_train = purejaxql.pqn_rnn_gymnax.make_train
+    make_train = purejaxql.pqn_rnn_gymnax_flat.make_train

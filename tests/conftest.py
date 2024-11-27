@@ -1,3 +1,4 @@
+import itertools
 import operator
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -134,73 +135,15 @@ def assert_results_not_empty(results: Mapping[str, Any]) -> None:
     assert all(v and v != (0,) for v in jax.tree.leaves(shapes)), shapes
 
 
-def convert_list_and_tuples_to_dicts(value: Any) -> Any:
-    """Converts all lists and tuples in a nested structure to dictionaries.
+class AlgoTests:
+    """Simple tests for a pqn module."""
 
-    >>> convert_list_and_tuples_to_dicts([1, 2, 3])
-    {'0': 1, '1': 2, '2': 3}
-    >>> convert_list_and_tuples_to_dicts((1, 2, 3))
-    {'0': 1, '1': 2, '2': 3}
-    >>> convert_list_and_tuples_to_dicts({"a": [1, 2, 3], "b": (4, 5, 6)})
-    {'a': {'0': 1, '1': 2, '2': 3}, 'b': {'0': 4, '1': 5, '2': 6}}
-    """
-    if isinstance(value, Mapping):
-        return {k: convert_list_and_tuples_to_dicts(v) for k, v in value.items()}
-    if isinstance(value, list | tuple):
-        # NOTE: Here we won't be able to distinguish between {"0": "bob"} and ["bob"]!
-        # But that's not too bad.
-        return {
-            f"{i}": convert_list_and_tuples_to_dicts(v) for i, v in enumerate(value)
-        }
-    return value
-
-
-class BaseTests:
-    original_make_train: Callable[[Any], Callable[[Any], Mapping]]
-    new_make_train: Callable[[Any], Callable[[chex.PRNGKey], Any]]
-
-    def test_results_are_the_same(
-        self, config: Config, jit: bool, seed: int, num_seeds: int | None
-    ):
-        # Interesting that this test fails when `jit=False`!
-
-        original_train_fn = type(self).original_make_train(config)
-        flattened_train_fn = type(self).new_make_train(config)
-
-        if num_seeds is not None:
-            original_train_fn = jax.vmap(original_train_fn)
-            flattened_train_fn = jax.vmap(flattened_train_fn)
-
-        if jit:
-            original_train_fn = jax.jit(original_train_fn)
-            flattened_train_fn = jax.jit(flattened_train_fn)
-
-        rng = jax.random.PRNGKey(seed)
-        if num_seeds is not None:
-            rng = jax.random.split(rng, num_seeds)
-
-        original_results = original_train_fn(rng)
-        flattened_results = flattened_train_fn(rng)
-
-        # NOTE: results := (train_state, expl_state, test_metrics, _rng)
-        # The bound methods are compared when doing `jax.tree.map(np.allclose, a, b)`, and since the datatypes might not
-        # be the same (even if they have the same structure), the comparison doesn't get to run and an error is raised.
-        structure = jax.tree.structure(original_results)
-        assert (
-            jax.tree.structure(original_results).num_leaves
-            == jax.tree.structure(flattened_results).num_leaves
-        )
-        are_equal = jax.tree.map(
-            np.allclose,
-            jax.tree.leaves(original_results),
-            jax.tree.leaves(flattened_results),
-        )
-        assert all(are_equal)  # jax.tree.unflatten(structure, are_equal)
+    make_train: Callable[[Any], Callable[[chex.PRNGKey], Any]]
 
     def test_train_is_deterministic(
         self, config: Config, jit: bool, seed: int, num_seeds: int | None
     ):
-        train_fn = type(self).new_make_train(config)
+        train_fn = type(self).make_train(config)
         if num_seeds is not None:
             train_fn = jax.vmap(train_fn)
         if jit:
@@ -228,7 +171,7 @@ class BaseTests:
         num_seeds: int | None,
     ):
         """Test that the results of `train` are reproduble for the same seed given the same hardware config."""
-        train_fn = type(self).new_make_train(config)
+        train_fn = type(self).make_train(config)
         if num_seeds is not None:
             train_fn = jax.vmap(train_fn)
         if jit:
@@ -247,3 +190,59 @@ class BaseTests:
                 sep=".",
             )
         )
+
+
+class ComparisonTests:
+    """Tests for comparing the results of two different implementations of the same algorithm."""
+
+    make_train: Callable[[Any], Callable[[chex.PRNGKey], Any]]
+    original_make_train: Callable[[Any], Callable[[Any], Mapping]]
+
+    def test_results_are_identical(
+        self, config: Config, jit: bool, seed: int, num_seeds: int | None
+    ):
+        # Interesting that this test fails when `jit=False`!
+        original_train_fn = type(self).original_make_train(config)
+        new_train_fn = type(self).make_train(config)
+
+        if num_seeds is not None:
+            original_train_fn = jax.vmap(original_train_fn)
+            new_train_fn = jax.vmap(new_train_fn)
+
+        if jit:
+            original_train_fn = jax.jit(original_train_fn)
+            new_train_fn = jax.jit(new_train_fn)
+
+        rng = jax.random.PRNGKey(seed)
+        if num_seeds is not None:
+            rng = jax.random.split(rng, num_seeds)
+
+        original_results = original_train_fn(rng)
+        flattened_results = new_train_fn(rng)
+
+        # NOTE: results := (train_state, expl_state, test_metrics, _rng)
+        # The bound methods are compared when doing `jax.tree.map(np.allclose, a, b)`, and since the datatypes might not
+        # be the same (even if they have the same structure), the comparison doesn't get to run and an error is raised.
+        print(jax.tree.structure(original_results))
+        for i, (val_a, val_b) in enumerate(
+            itertools.zip_longest(
+                jax.tree.leaves(original_results), jax.tree.leaves(flattened_results)
+            )
+        ):
+            # todo: how could we get the "path" to the value in the pytree?
+            assert val_a is not None
+            assert val_b is not None
+
+            np.testing.assert_allclose(val_a, val_b, err_msg=f"leaf {i}")
+
+        assert (
+            jax.tree.structure(original_results)
+            == jax.tree.structure(flattened_results).num_leaves
+        )
+
+        are_equal = jax.tree.map(
+            np.allclose,
+            jax.tree.leaves(original_results),
+            jax.tree.leaves(flattened_results),
+        )
+        assert all(are_equal)  # jax.tree.unflatten(structure, are_equal)

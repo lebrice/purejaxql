@@ -19,18 +19,15 @@ import flax.struct
 import gymnax
 import hydra
 import jax
-
 import jax.numpy as jnp
 import numpy as np
 import optax
-from typing_extensions import TypedDict
-
 from flax.core.frozen_dict import FrozenDict
 from flax.typing import FrozenVariableDict
 from gymnax.environments.environment import Environment, TEnvParams, TEnvState
 from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
 from omegaconf import OmegaConf
-from typing_extensions import NotRequired
+from typing_extensions import NotRequired, TypedDict
 from xtils.jitpp import Static, jit
 
 import wandb
@@ -82,6 +79,7 @@ class Config(TypedDict):
     ALG_NAME: str
     SAVE_PATH: NotRequired[str]
     WANDB_LOG_ALL_SEEDS: NotRequired[bool]
+    HYP_TUNE: bool
 
 
 def _get_num_updates(config: Config) -> int:
@@ -104,11 +102,11 @@ def make_train(config: Config):
     NUM_UPDATES = _get_num_updates(config)
     NUM_UPDATES_DECAY = _get_num_updates_decay(config)
     TEST_NUM_STEPS: int = config.get("TEST_NUM_STEPS", env_params.max_steps_in_episode)
-    # note: These are not necessary, and modifying the config in-place is not good practice IMO,
+    # Modifying the config in-place is not good practice IMO,
     # but I'm just leaving it here to be 100% identical to the base implementation.
-    config["NUM_UPDATES"] = NUM_UPDATES
-    config["NUM_UPDATES_DECAY"] = NUM_UPDATES_DECAY
-    config["TEST_NUM_STEPS"] = TEST_NUM_STEPS
+    # config["NUM_UPDATES"] = NUM_UPDATES
+    # config["NUM_UPDATES_DECAY"] = NUM_UPDATES_DECAY
+    # config["TEST_NUM_STEPS"] = TEST_NUM_STEPS
 
     # epsilon-greedy exploration
 
@@ -117,6 +115,8 @@ def make_train(config: Config):
         config=FrozenDict(config),
         env=env,
         env_params=env_params,
+        num_updates=_get_num_updates(config),
+        num_updates_decay=_get_num_updates_decay(config),
         test_num_steps=TEST_NUM_STEPS,
     )
 
@@ -134,6 +134,8 @@ def train(
     config: Static[Config],
     env: Static[Environment[TEnvState, TEnvParams]],
     env_params: TEnvParams,
+    num_updates: Static[int],
+    num_updates_decay: Static[int],
     test_num_steps: Static[int],
 ) -> Results[TEnvState]:
     # todo: Why at index 0? Is this assuming that we're always under `vmap` context?
@@ -144,13 +146,13 @@ def train(
     eps_scheduler = optax.linear_schedule(
         config["EPS_START"],
         config["EPS_FINISH"],
-        config["EPS_DECAY"] * _get_num_updates_decay(config),
+        config["EPS_DECAY"] * num_updates_decay,
     )
 
     lr_scheduler = optax.linear_schedule(
         init_value=config["LR"],
         end_value=1e-20,
-        transition_steps=_get_num_updates_decay(config)
+        transition_steps=num_updates_decay
         * config["NUM_MINIBATCHES"]
         * config["NUM_EPOCHS"],
     )
@@ -203,7 +205,10 @@ def train(
 
     runner_state = (train_state, expl_state, test_metrics, _rng)
     runner_state, metrics = jax.lax.scan(
-        update_step, init=runner_state, xs=None, length=_get_num_updates(config)
+        update_step,
+        init=runner_state,
+        xs=None,
+        length=num_updates,
     )
 
     return {"runner_state": runner_state, "metrics": metrics}
