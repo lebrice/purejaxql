@@ -1,5 +1,5 @@
 """
-When test_during_training is set to True, an additional number of parallel test environments are used to evaluate the agent during training using greedy actions, 
+When test_during_training is set to True, an additional number of parallel test environments are used to evaluate the agent during training using greedy actions,
 but not for training purposes. Stopping training for evaluation can be very expensive, as an episode in Atari can last for hundreds of thousands of steps.
 """
 
@@ -104,7 +104,6 @@ class LogEnvState:
 
 
 class JaxLogEnvPoolWrapper(gym.Wrapper):
-
     def __init__(self, env, reset_info=True, async_mode=True):
         super(JaxLogEnvPoolWrapper, self).__init__(env)
         self.num_envs = getattr(env, "num_envs", 1)
@@ -139,7 +138,6 @@ class JaxLogEnvPoolWrapper(gym.Wrapper):
 
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state, action):
-
         new_handle, (observations, rewards, dones, infos) = self.step_f(
             state.handle, action
         )
@@ -191,7 +189,6 @@ class JaxLogEnvPoolWrapper(gym.Wrapper):
 
 
 class CNN(nn.Module):
-
     norm_type: str = "layer_norm"
 
     @nn.compact
@@ -273,7 +270,6 @@ class CustomTrainState(TrainState):
 
 
 def make_train(config):
-
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -328,7 +324,6 @@ def make_train(config):
     init_obs, env_state = env.reset()
 
     def train(rng):
-
         original_seed = rng[0]
 
         eps_scheduler = optax.linear_schedule(
@@ -375,7 +370,6 @@ def make_train(config):
 
         # TRAINING LOOP
         def _update_step(runner_state, unused):
-
             train_state, expl_state, test_metrics, rng = runner_state
 
             # SAMPLE PHASE
@@ -424,7 +418,7 @@ def make_train(config):
 
             if config.get("TEST_DURING_TRAINING", False):
                 # remove testing envs
-                transitions = jax.tree_map(
+                transitions = jax.tree.map(
                     lambda x: x[:, : -config["TEST_ENVS"]], transitions
                 )
 
@@ -461,7 +455,7 @@ def make_train(config):
                 _, targets = jax.lax.scan(
                     _get_target,
                     (lambda_returns, last_q),
-                    jax.tree_map(lambda x: x[:-1], (reward, q_vals, done)),
+                    jax.tree.map(lambda x: x[:-1], (reward, q_vals, done)),
                     reverse=True,
                 )
                 targets = jnp.concatenate([targets, lambda_returns[np.newaxis]])
@@ -476,7 +470,6 @@ def make_train(config):
                 train_state, rng = carry
 
                 def _learn_phase(carry, minibatch_and_target):
-
                     train_state, rng = carry
                     minibatch, target = minibatch_and_target
 
@@ -522,7 +515,7 @@ def make_train(config):
                 minibatches = jax.tree_util.tree_map(
                     lambda x: preprocess_transition(x, _rng), transitions
                 )  # num_actors*num_envs (batch_size), ...
-                targets = jax.tree_map(
+                targets = jax.tree.map(
                     lambda x: preprocess_transition(x, _rng), lambda_targets
                 )
 
@@ -541,8 +534,8 @@ def make_train(config):
             train_state = train_state.replace(n_updates=train_state.n_updates + 1)
 
             if config.get("TEST_DURING_TRAINING", False):
-                test_infos = jax.tree_map(lambda x: x[:, -config["TEST_ENVS"] :], infos)
-                infos = jax.tree_map(lambda x: x[:, : -config["TEST_ENVS"]], infos)
+                test_infos = jax.tree.map(lambda x: x[:, -config["TEST_ENVS"] :], infos)
+                infos = jax.tree.map(lambda x: x[:, : -config["TEST_ENVS"]], infos)
                 infos.update({"test_" + k: v for k, v in test_infos.items()})
 
             metrics = {
@@ -598,7 +591,6 @@ def make_train(config):
 
 
 def single_run(config):
-
     config = {**config, **config["alg"]}
 
     alg_name = config.get("ALG_NAME", "pqn")
@@ -612,7 +604,7 @@ def single_run(config):
             env_name.upper(),
             f"jax_{jax.__version__}",
         ],
-        name=f'{config["ALG_NAME"]}_{config["ENV_NAME"]}',
+        name=f"{config['ALG_NAME']}_{config['ENV_NAME']}",
         config=config,
         mode=config["WANDB_MODE"],
     )
@@ -624,7 +616,7 @@ def single_run(config):
         raise NotImplementedError("Vmapped seeds not supported yet.")
     else:
         outs = jax.jit(make_train(config))(rng)
-    print(f"Took {time.time()-t0} seconds to complete.")
+    print(f"Took {time.time() - t0} seconds to complete.")
 
     # save params
     if config.get("SAVE_PATH", None) is not None:
@@ -636,7 +628,7 @@ def single_run(config):
         OmegaConf.save(
             config,
             os.path.join(
-                save_dir, f'{alg_name}_{env_name}_seed{config["SEED"]}_config.yaml'
+                save_dir, f"{alg_name}_{env_name}_seed{config['SEED']}_config.yaml"
             ),
         )
 
@@ -644,7 +636,7 @@ def single_run(config):
         params = model_state.params
         save_path = os.path.join(
             save_dir,
-            f'{alg_name}_{env_name}_seed{config["SEED"]}.safetensors',
+            f"{alg_name}_{env_name}_seed{config['SEED']}.safetensors",
         )
         save_params(params, save_path)
 

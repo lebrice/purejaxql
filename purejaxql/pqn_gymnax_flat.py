@@ -647,19 +647,19 @@ def single_run(_config: dict):
             env_name.upper(),
             f"jax_{jax.__version__}",
         ],
-        name=config.get("NAME", f'{config["ALG_NAME"]}_{config["ENV_NAME"]}'),
+        name=config.get("NAME", f"{config['ALG_NAME']}_{config['ENV_NAME']}"),
         config=dict(config),
         mode=config["WANDB_MODE"],
         save_code=True,
     )
 
-    rng = jax.random.PRNGKey(config["SEED"])
+    rng = jax.random.key(config["SEED"])
 
     t0 = time.perf_counter()
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
     train_vjit = jax.jit(jax.vmap(make_train(config)))  # type: ignore
     outs = jax.block_until_ready(train_vjit(rngs))
-    print(f"Took {time.perf_counter()-t0:.2f} seconds to complete.")
+    print(f"Took {time.perf_counter() - t0:.2f} seconds to complete.")
 
     if (save_path := config.get("SAVE_PATH")) is not None:
         # todo: this import is failing:
@@ -668,13 +668,13 @@ def single_run(_config: dict):
         os.makedirs(save_dir, exist_ok=True)
         OmegaConf.save(
             dict(config),
-            save_dir / f'{alg_name}_{env_name}_seed{config["SEED"]}_config.yaml',
+            save_dir / f"{alg_name}_{env_name}_seed{config['SEED']}_config.yaml",
         )
         for i, rng in enumerate(rngs):
             params = jax.tree.map(operator.itemgetter(i), model_state.params)
             save_path = (
                 save_dir
-                / f'{alg_name}_{env_name}_seed{config["SEED"]}_vmap{i}.safetensors'
+                / f"{alg_name}_{env_name}_seed{config['SEED']}_vmap{i}.safetensors"
             )
             save_params(params, save_path)
     return outs

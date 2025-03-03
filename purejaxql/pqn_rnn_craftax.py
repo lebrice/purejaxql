@@ -1,6 +1,7 @@
 """
 This script uses BatchRenorm for more effective batch normalization in long training runs.
 """
+
 import os
 import time
 import copy
@@ -69,7 +70,6 @@ class BatchRenorm(Module):
 
     @compact
     def __call__(self, x, use_running_average: Optional[bool] = None):
-
         use_running_average = merge_param(
             "use_running_average", self.use_running_average, use_running_average
         )
@@ -163,7 +163,6 @@ class BatchRenorm(Module):
 
 
 class ScannedRNN(nn.Module):
-
     @partial(
         nn.scan,
         variable_broadcast="params",
@@ -179,7 +178,7 @@ class ScannedRNN(nn.Module):
         hidden_size = rnn_state[0].shape[-1]
 
         init_rnn_state = self.initialize_carry(hidden_size, *resets.shape)
-        rnn_state = jax.tree_map(
+        rnn_state = jax.tree.map(
             lambda init, old: jnp.where(resets[:, np.newaxis], init, old),
             init_rnn_state,
             rnn_state,
@@ -268,7 +267,6 @@ class CustomTrainState(TrainState):
 
 
 def make_train(config):
-
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -317,16 +315,14 @@ def make_train(config):
         )
         return chosed_actions
 
-
     def train(rng):
-
         original_rng = rng[0]
         eps_scheduler = optax.linear_schedule(
             config["EPS_START"],
             config["EPS_FINISH"],
             (config["EPS_DECAY"]) * config["NUM_UPDATES_DECAY"],
         )
-        
+
         lr_scheduler = optax.linear_schedule(
             init_value=config["LR"],
             end_value=1e-20,
@@ -375,7 +371,6 @@ def make_train(config):
 
         # TRAINING LOOP
         def _update_step(runner_state, unused):
-
             train_state, memory_transitions, expl_state, test_metrics, rng = (
                 runner_state
             )
@@ -443,7 +438,7 @@ def make_train(config):
             )  # update timesteps count
 
             # insert the transitions into the memory
-            memory_transitions = jax.tree_map(
+            memory_transitions = jax.tree.map(
                 lambda x, y: jnp.concatenate([x[config["NUM_STEPS"] :], y], axis=0),
                 memory_transitions,
                 transitions,
@@ -454,12 +449,13 @@ def make_train(config):
                 train_state, rng = carry
 
                 def _learn_phase(carry, minibatch):
-
                     # minibatch shape: num_steps, batch_size, ...
                     # with batch_size = num_envs/num_minibatches
 
                     train_state, rng = carry
-                    hs = jax.tree_map(lambda x: x[0], minibatch.last_hs)  # hs of oldest step (batch_size, hidden_size)
+                    hs = jax.tree.map(
+                        lambda x: x[0], minibatch.last_hs
+                    )  # hs of oldest step (batch_size, hidden_size)
                     agent_in = (
                         minibatch.obs,
                         minibatch.last_done,
@@ -489,7 +485,7 @@ def make_train(config):
                         _, targets = jax.lax.scan(
                             _get_target,
                             (lambda_returns, last_q),
-                            jax.tree_map(lambda x: x[:-1], (reward, q_vals, done)),
+                            jax.tree.map(lambda x: x[:-1], (reward, q_vals, done)),
                             reverse=True,
                         )
                         targets = jnp.concatenate([targets, lambda_returns[np.newaxis]])
@@ -512,17 +508,13 @@ def make_train(config):
                             target_q_vals[:-1],
                             minibatch.reward[:-1],
                             minibatch.done[:-1],
-                        ).reshape(
-                            -1
-                        )  # (num_steps-1*batch_size,)
+                        ).reshape(-1)  # (num_steps-1*batch_size,)
 
                         chosen_action_qvals = jnp.take_along_axis(
                             q_vals,
                             jnp.expand_dims(minibatch.action, axis=-1),
                             axis=-1,
-                        ).squeeze(
-                            axis=-1
-                        )  # (num_steps, num_agents, batch_size,)
+                        ).squeeze(axis=-1)  # (num_steps, num_agents, batch_size,)
                         chosen_action_qvals = chosen_action_qvals[:-1].reshape(
                             -1
                         )  # (num_steps-1*batch_size,)
@@ -580,7 +572,7 @@ def make_train(config):
                 "td_loss": loss.mean(),
                 "qvals": qvals.mean(),
             }
-            done_infos = jax.tree_map(
+            done_infos = jax.tree.map(
                 lambda x: (x * infos["returned_episode"]).sum()
                 / infos["returned_episode"].sum(),
                 infos,
@@ -631,7 +623,6 @@ def make_train(config):
             return runner_state, None
 
         def get_test_metrics(train_state, rng):
-
             if not config.get("TEST_DURING_TRAINING", False):
                 return None
 
@@ -684,7 +675,7 @@ def make_train(config):
                 _greedy_env_step, step_state, None, config["TEST_NUM_STEPS"]
             )
             # return mean of done infos
-            done_infos = jax.tree_map(
+            done_infos = jax.tree.map(
                 lambda x: (x * infos["returned_episode"]).sum()
                 / infos["returned_episode"].sum(),
                 infos,
@@ -770,7 +761,6 @@ def make_train(config):
 
 
 def single_run(config):
-
     config = {**config, **config["alg"]}
 
     alg_name = config.get("ALG_NAME", "pqn_rnn")
@@ -784,7 +774,7 @@ def single_run(config):
             env_name.upper(),
             f"jax_{jax.__version__}",
         ],
-        name=f'{config["ALG_NAME"]}_{config["ENV_NAME"]}',
+        name=f"{config['ALG_NAME']}_{config['ENV_NAME']}",
         config=config,
         mode=config["WANDB_MODE"],
     )
@@ -795,7 +785,7 @@ def single_run(config):
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
     train_vjit = jax.jit(jax.vmap(make_train(config)))
     outs = jax.block_until_ready(train_vjit(rngs))
-    print(f"Took {time.time()-t0} seconds to complete.")
+    print(f"Took {time.time() - t0} seconds to complete.")
 
     if config.get("SAVE_PATH", None) is not None:
         from jaxmarl.wrappers.baselines import save_params
@@ -806,15 +796,15 @@ def single_run(config):
         OmegaConf.save(
             config,
             os.path.join(
-                save_dir, f'{alg_name}_{env_name}_seed{config["SEED"]}_config.yaml'
+                save_dir, f"{alg_name}_{env_name}_seed{config['SEED']}_config.yaml"
             ),
         )
 
         for i, rng in enumerate(rngs):
-            params = jax.tree_map(lambda x: x[i], model_state.params)
+            params = jax.tree.map(lambda x: x[i], model_state.params)
             save_path = os.path.join(
                 save_dir,
-                f'{alg_name}_{env_name}_seed{config["SEED"]}_vmap{i}.safetensors',
+                f"{alg_name}_{env_name}_seed{config['SEED']}_vmap{i}.safetensors",
             )
             save_params(params, save_path)
 
