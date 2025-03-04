@@ -648,7 +648,7 @@ def _greedy_env_step(
     config: Static[Config],
     test_env: Static[GymnaxWrapper],
     env_params: EnvParams,
-    _rng: Static[chex.PRNGKey],
+    _rng: chex.PRNGKey,
 ):
     expl_state, rng = step_state
     hs, last_obs, last_done, last_action, env_state = expl_state
@@ -1089,9 +1089,9 @@ def single_run(_config: dict):
     alg_name = config.get("ALG_NAME", "pqn_rnn")
     env_name = config["ENV_NAME"]
 
-    jax_distributed_initialize(
-        local_device_ids=list(range(distributed_env.gpus_per_task))
-    )
+    # jax_distributed_initialize(
+    #     local_device_ids=list(range(distributed_env.gpus_per_task))
+    # )
 
     wandb.init(
         entity=config["ENTITY"],
@@ -1112,7 +1112,7 @@ def single_run(_config: dict):
 
     t0 = time.time()
     num_seeds = config["NUM_SEEDS"]
-    assert num_seeds % 2 == 0, "Debugging distributed stuff for now."
+    # assert num_seeds % 2 == 0, "Debugging distributed stuff for now."
     rngs = jax.random.split(rng, num_seeds)
     # gpus_on_node = distributed_env.gpus_per_task
     # mesh = jax.make_mesh(
@@ -1122,8 +1122,7 @@ def single_run(_config: dict):
     # jax.debug.visualize_array_sharding(rngs)
 
     train_fn = make_train(config)
-    train_vjit = jax.jit(jax.vmap(train_fn))
-    outs = jax.block_until_ready(train_vjit(rngs))
+    outs = jax.block_until_ready(jax.jit(jax.vmap(train_fn))(rngs))
     print(f"Took {time.time() - t0} seconds to complete.")
 
     if (save_path := config.get("SAVE_PATH")) is not None:
@@ -1206,7 +1205,7 @@ def wrapped_make_train(default_config: Config):
 
     rng = jax.random.PRNGKey(config["SEED"])
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    train_vjit = jax.jit(jax.pmap(make_train(config)))
+    train_vjit = jax.jit(jax.vmap(make_train(config)))
     outs = jax.block_until_ready(train_vjit(rngs))
     return outs
 
