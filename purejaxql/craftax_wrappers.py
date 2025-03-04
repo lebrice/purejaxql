@@ -7,7 +7,7 @@ from functools import partial
 from typing import Optional, Tuple, Union, Any
 
 
-class GymnaxWrapper(object):
+class GymnaxWrapper:
     """Base class for Gymnax wrappers."""
 
     def __init__(self, env):

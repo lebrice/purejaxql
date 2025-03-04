@@ -15,30 +15,17 @@ import chex
 import optax
 import flax.linen as nn
 from flax.training.train_state import TrainState
-from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
 import hydra
 from omegaconf import OmegaConf
-import gymnax
 import wandb
 
 from craftax.craftax_env import make_craftax_env_from_name
-from craftax_wrappers import (
-    LogWrapper,
-    OptimisticResetVecEnvWrapper,
-    BatchEnvWrapper,
-)
+from craftax_wrappers import LogWrapper, OptimisticResetVecEnvWrapper, BatchEnvWrapper
 
 from flax.linen.normalization import _compute_stats, _normalize, _canonicalize_axes
-from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union
-from flax.linen.dtypes import canonicalize_dtype
-from flax.linen.module import (
-    Module,
-    compact,
-    merge_param,
-)  # pylint: disable=g-multiple-import
-from jax import lax
+from typing import Callable, Optional, Sequence, Tuple, Union
+from flax.linen.module import Module, compact, merge_param
 from jax.nn import initializers
-import jax.numpy as jnp
 
 
 PRNGKey = Any
