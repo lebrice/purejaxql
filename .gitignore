@@ -13,4 +13,5 @@ outputs/
 models/
 
 **.npz
-**.safetensors
+**.safetensorspurejaxql/.schemas
+purejaxql/.schemas

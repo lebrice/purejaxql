@@ -76,7 +76,6 @@ class CustomTrainState(TrainState):
 
 
 def make_train(config):
-
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -120,7 +119,6 @@ def make_train(config):
         return chosed_actions
 
     def train(rng):
-
         original_rng = rng[0]
 
         eps_scheduler = optax.linear_schedule(
@@ -168,7 +166,6 @@ def make_train(config):
 
         # TRAINING LOOP
         def _update_step(runner_state, unused):
-
             train_state, expl_state, test_metrics, rng = runner_state
 
             # SAMPLE PHASE
@@ -248,7 +245,7 @@ def make_train(config):
             _, targets = jax.lax.scan(
                 _get_target,
                 (lambda_returns, last_q),
-                jax.tree_map(lambda x: x[:-1], transitions),
+                jax.tree.map(lambda x: x[:-1], transitions),
                 reverse=True,
             )
             lambda_targets = jnp.concatenate((targets, lambda_returns[np.newaxis]))
@@ -258,7 +255,6 @@ def make_train(config):
                 train_state, rng = carry
 
                 def _learn_phase(carry, minibatch_and_target):
-
                     train_state, rng = carry
                     minibatch, target = minibatch_and_target
 
@@ -304,7 +300,7 @@ def make_train(config):
                 minibatches = jax.tree_util.tree_map(
                     lambda x: preprocess_transition(x, _rng), transitions
                 )  # num_actors*num_envs (batch_size), ...
-                targets = jax.tree_map(
+                targets = jax.tree.map(
                     lambda x: preprocess_transition(x, _rng), lambda_targets
                 )
 
@@ -362,7 +358,6 @@ def make_train(config):
             return runner_state, metrics
 
         def get_test_metrics(train_state, rng):
-
             if not config.get("TEST_DURING_TRAINING", False):
                 return None
 
@@ -393,7 +388,7 @@ def make_train(config):
                 _env_step, (env_state, init_obs, _rng), None, config["TEST_NUM_STEPS"]
             )
             # return mean of done infos
-            done_infos = jax.tree_map(
+            done_infos = jax.tree.map(
                 lambda x: jnp.nanmean(
                     jnp.where(
                         infos["returned_episode"],
@@ -425,7 +420,6 @@ def make_train(config):
 
 
 def single_run(config):
-
     config = {**config, **config["alg"]}
 
     alg_name = config.get("ALG_NAME", "pqn")
@@ -439,7 +433,7 @@ def single_run(config):
             env_name.upper(),
             f"jax_{jax.__version__}",
         ],
-        name=config.get("NAME", f'{config["ALG_NAME"]}_{config["ENV_NAME"]}'),
+        name=config.get("NAME", f"{config['ALG_NAME']}_{config['ENV_NAME']}"),
         config=config,
         mode=config["WANDB_MODE"],
     )
@@ -450,7 +444,7 @@ def single_run(config):
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
     train_vjit = jax.jit(jax.vmap(make_train(config)))
     outs = jax.block_until_ready(train_vjit(rngs))
-    print(f"Took {time.time()-t0} seconds to complete.")
+    print(f"Took {time.time() - t0} seconds to complete.")
 
     if config.get("SAVE_PATH", None) is not None:
         model_state = outs["runner_state"][0]
@@ -459,15 +453,15 @@ def single_run(config):
         OmegaConf.save(
             config,
             os.path.join(
-                save_dir, f'{alg_name}_{env_name}_seed{config["SEED"]}_config.yaml'
+                save_dir, f"{alg_name}_{env_name}_seed{config['SEED']}_config.yaml"
             ),
         )
 
         for i, rng in enumerate(rngs):
-            params = jax.tree_map(lambda x: x[i], model_state.params)
+            params = jax.tree.map(lambda x: x[i], model_state.params)
             save_path = os.path.join(
                 save_dir,
-                f'{alg_name}_{env_name}_seed{config["SEED"]}_vmap{i}.safetensors',
+                f"{alg_name}_{env_name}_seed{config['SEED']}_vmap{i}.safetensors",
             )
             save_params(params, save_path)
 
