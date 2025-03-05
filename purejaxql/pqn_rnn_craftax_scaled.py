@@ -545,7 +545,7 @@ def random_step(
     train_state: CustomTrainState,
     config: Static[Config],
     env: Static[BatchEnvWrapper],
-    env_params: EnvParams,
+    env_params: Static[EnvParams],
 ):
     expl_state, rng = carry
     hs, last_obs, last_done, last_action, env_state = expl_state
@@ -647,7 +647,7 @@ def _greedy_env_step(
     train_state: CustomTrainState,
     config: Static[Config],
     test_env: Static[GymnaxWrapper],
-    env_params: EnvParams,
+    env_params: Static[EnvParams],
     _rng: chex.PRNGKey,
 ):
     expl_state, rng = step_state
@@ -690,7 +690,7 @@ def update_step(
     config: Static[Config],
     network: Static[RNNQNetwork],
     env: Static[BatchEnvWrapper],
-    env_params: EnvParams,
+    env_params: Static[EnvParams],
     eps_scheduler: Static[optax.Schedule],
     original_rng: chex.PRNGKey,
     test_env: Static[GymnaxWrapper],
@@ -985,7 +985,7 @@ def step_env(
     config: Static[Config],
     eps_scheduler: Static[optax.Schedule],
     env: Static[BatchEnvWrapper],
-    env_params: EnvParams,
+    env_params: Static[EnvParams],
 ):
     _exploration_state, rng = carry
     hs, last_obs, last_done, last_action, env_state = _exploration_state
@@ -1037,7 +1037,7 @@ def step_env(
 def create_agent(
     rng: chex.PRNGKey,
     env: Static[BatchEnvWrapper],
-    env_params: EnvParams,
+    env_params: Static[EnvParams],
     config: Static[Config],
     network: Static[RNNQNetwork],
     lr: Static[float | jax.Array | optax.Schedule],
