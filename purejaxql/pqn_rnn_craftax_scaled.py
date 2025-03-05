@@ -11,44 +11,53 @@ import dataclasses
 import functools
 import os
 import time
-import copy
+from functools import partial
+from typing import (
+    Any,
+    Callable,
+    Literal,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    TypedDict,
+    Union,
+)
+
+import chex
+import flax.jax_utils
+import flax.linen as nn
+import flax.struct
+import hydra
 import jax
+import jax.distributed
 import jax.experimental
 import jax.experimental.mesh_utils
 import jax.numpy as jnp
-from flax.core.frozen_dict import FrozenDict
-from jax._src.distributed import initialize as jax_distributed_initialize
-import flax.struct
 import numpy as np
-from functools import partial
-from typing import Any, Generic, NamedTuple, TypedDict, Literal
-from typing_extensions import NotRequired
-from craftax.craftax.craftax_state import EnvParams, EnvState
-import chex
 import optax
-import flax.linen as nn
-from flax.training.train_state import TrainState
-import hydra
-from omegaconf import OmegaConf
-import wandb
-from xtils.jitpp import Static, jit
-from flax.traverse_util import flatten_dict, unflatten_dict
-from jax.sharding import PartitionSpec, NamedSharding  # noqa
-from safetensors.flax import load_file, save_file
-
+from craftax.craftax.craftax_state import EnvParams, EnvState
 from craftax.craftax_env import make_craftax_env_from_name
 from craftax_wrappers import (
+    BatchEnvWrapper,
     GymnaxWrapper,
     LogWrapper,
     OptimisticResetVecEnvWrapper,
-    BatchEnvWrapper,
 )
-
-from flax.linen.normalization import _compute_stats, _normalize, _canonicalize_axes
-from typing import Callable, Optional, Sequence, Tuple, Union
+from flax.core.frozen_dict import FrozenDict
 from flax.linen.module import Module, compact, merge_param
+from flax.linen.normalization import _canonicalize_axes, _compute_stats, _normalize
+from flax.training.train_state import TrainState
+from flax.traverse_util import flatten_dict, unflatten_dict
+from jax._src.distributed import initialize as jax_distributed_initialize
 from jax.nn import initializers
+from jax.sharding import NamedSharding, PartitionSpec  # noqa
+from omegaconf import OmegaConf
+from safetensors.flax import load_file, save_file
+from typing_extensions import NotRequired
+from xtils.jitpp import Static, jit
 
+import wandb
 
 PRNGKey = Any
 Array = Any
@@ -82,6 +91,11 @@ def get_gpus_per_task(tres_per_task: str) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class SlurmDistributedEnv:
+    """Distributed training context derived from SLURM Environment variables."""
+
+    job_id: int = dataclasses.field(
+        default_factory=lambda: int(os.environ["SLURM_JOB_ID"])
+    )
     global_rank: int = dataclasses.field(
         default_factory=lambda: int(os.environ["SLURM_PROCID"])
     )
@@ -1082,16 +1096,36 @@ def eps_greedy_exploration(rng: chex.PRNGKey, q_vals: jax.Array, eps: jax.Array)
     return chosed_actions
 
 
-def single_run(_config: dict):
+# Including this here to make this compatible with jaxmarl 0.0.4
+# (seems like those functions were removed or moved to a different place?)
+
+
+def save_params(params: dict, filename: str | os.PathLike) -> None:
+    flattened_dict = flatten_dict(params, sep=",")
+    save_file(flattened_dict, filename)  # type: ignore
+
+
+def load_params(filename: str | os.PathLike) -> dict:
+    flattened_dict = load_file(filename)
+    return unflatten_dict(flattened_dict, sep=",")
+
+
+@hydra.main(version_base=None, config_path="./config", config_name="pqn_rnn_craftax")
+def main(_config):
+    _config = OmegaConf.to_container(_config)
+    assert isinstance(_config, dict)
+    print("Config:\n", OmegaConf.to_yaml(_config))
+
     distributed_env = SlurmDistributedEnv()
+    # todo: This pattern is bad, why is there even an `alg` config group? Makes no sense.
     config: Config = {**_config, **_config["alg"]}  # type: ignore
 
     alg_name = config.get("ALG_NAME", "pqn_rnn")
     env_name = config["ENV_NAME"]
 
-    # jax_distributed_initialize(
-    #     local_device_ids=list(range(distributed_env.gpus_per_task))
-    # )
+    jax_distributed_initialize(
+        local_device_ids=list(range(distributed_env.gpus_per_task))
+    )
 
     wandb.init(
         entity=config["ENTITY"],
@@ -1113,18 +1147,28 @@ def single_run(_config: dict):
     t0 = time.time()
     num_seeds = config["NUM_SEEDS"]
     # assert num_seeds % 2 == 0, "Debugging distributed stuff for now."
-    rngs = jax.random.split(rng, num_seeds)
-    # gpus_on_node = distributed_env.gpus_per_task
-    # mesh = jax.make_mesh(
-    #     (gpus_on_node, num_seeds // gpus_on_node), PartitionSpec("x", "y")
-    # )
-    # rngs = jax.device_put(rngs, NamedSharding(mesh, PartitionSpec("x", "y")))
-    # jax.debug.visualize_array_sharding(rngs)
+    # todo: figure out how to properly share / shard / split stuff.
+    rngs = jax.random.split(rng, num_seeds).reshape((num_seeds, -1))
 
+    gpus_on_node = distributed_env.gpus_per_task * distributed_env.ntasks_per_node
+
+    mesh = jax.make_mesh(
+        (num_seeds // distributed_env.num_nodes, distributed_env.num_nodes),
+        PartitionSpec("x", "y"),
+    )
+    rngs = jax.device_put(rngs, NamedSharding(mesh, PartitionSpec("x", "y")))
+    jax.debug.visualize_array_sharding(rngs)
+    # TODO: Look into `flax.jax_utils.replicate` and how it is used in the Stoix repo
+    # https://github.com/EdanToledo/Stoix/blob/main/stoix/systems/q_learning/ff_qr_dqn.py
+
+    # TODO: Add profiling hooks following https://docs.jax.dev/en/latest/profiling.html
     train_fn = make_train(config)
-    outs = jax.block_until_ready(jax.jit(jax.vmap(train_fn))(rngs))
+    outs: Results = jax.block_until_ready(jax.jit(jax.vmap(train_fn))(rngs))
     print(f"Took {time.time() - t0} seconds to complete.")
-
+    print(jax.tree.map(jnp.shape, outs["metrics"]))
+    mean_metrics = jax.lax.pmean(outs["metrics"], ("x", "y"))
+    print(jax.tree.map(jnp.shape, mean_metrics))
+    return
     if (save_path := config.get("SAVE_PATH")) is not None:
         model_state = outs["runner_state"][0]
         save_dir = os.path.join(save_path, env_name)
@@ -1144,80 +1188,7 @@ def single_run(_config: dict):
             )
             save_params(params, save_path)
 
-
-# Including this here to make this compatible with jaxmarl 0.0.4
-# (seems like those functions were removed or moved to a different place?)
-
-
-def save_params(params: dict, filename: str | os.PathLike) -> None:
-    flattened_dict = flatten_dict(params, sep=",")
-    save_file(flattened_dict, filename)  # type: ignore
-
-
-def load_params(filename: str | os.PathLike) -> dict:
-    flattened_dict = load_file(filename)
-    return unflatten_dict(flattened_dict, sep=",")
-
-
-def tune(_default_config: dict):
-    """Hyperparameter sweep with wandb."""
-
-    default_config: Config = {**_default_config, **_default_config["alg"]}  # type: ignore
-    alg_name = default_config.get("ALG_NAME", "pqn")
-    env_name = default_config["ENV_NAME"]
-
-    sweep_config = {
-        "name": f"{alg_name}_{env_name}",
-        "method": "bayes",
-        "metric": {
-            "name": "test_returned_episode_returns",
-            "goal": "maximize",
-        },
-        "parameters": {
-            "LR": {
-                "values": [
-                    0.001,
-                    0.0005,
-                    0.0001,
-                    0.00005,
-                ]
-            },
-        },
-    }
-
-    wandb.login()
-    sweep_id = wandb.sweep(
-        sweep_config, entity=default_config["ENTITY"], project=default_config["PROJECT"]
-    )
-    wandb.agent(
-        sweep_id, functools.partial(wrapped_make_train, default_config), count=1000
-    )
-
-
-def wrapped_make_train(default_config: Config):
-    wandb.init(project=default_config["PROJECT"])
-
-    config = copy.deepcopy(default_config)
-    for k, v in dict(wandb.config).items():
-        config[k] = v
-
-    print("running experiment with params:", config)
-
-    rng = jax.random.PRNGKey(config["SEED"])
-    rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    train_vjit = jax.jit(jax.vmap(make_train(config)))
-    outs = jax.block_until_ready(train_vjit(rngs))
-    return outs
-
-
-@hydra.main(version_base=None, config_path="./config", config_name="config")
-def main(config):
-    config = OmegaConf.to_container(config)
-    print("Config:\n", OmegaConf.to_yaml(config))
-    if config["HYP_TUNE"]:
-        tune(config)
-    else:
-        single_run(config)
+    jax.distributed.shutdown()
 
 
 if __name__ == "__main__":
