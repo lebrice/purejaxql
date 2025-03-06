@@ -6,7 +6,7 @@ SEED: 0
 HYP_TUNE: False
 
 # wandb params
-WANDB_MODE: "disabled"  # set to online to activate wandb
+WANDB_MODE: "disabled" # set to online to activate wandb
 ENTITY: ""
 PROJECT: ""
 alg:
