@@ -2,7 +2,7 @@
 This script uses BatchRenorm for more effective batch normalization in long training runs.
 
 ```
-JAX_TRACEBACK_FILTERING=off srun --pty --gpus-per-task=4 --ntasks-per-node=1 --nodes=1 --cpus-per-task=48 --mem=0 --partition=gpubase_bynode_b3 \
+JAX_TRACEBACK_FILTERING=off srun --pty --nodes=1 --ntasks-per-node=1 --gpus-per-task=4 --cpus-per-task=48 --mem=0 --partition=gpubase_bynode_b3 \
     uv run python purejaxql/pqn_rnn_craftax_scaled.py +alg=pqn_rnn_craftax alg.TOTAL_TIMESTEPS=100 alg.TOTAL_TIMESTEPS_DECAY=100 NUM_SEEDS=4
 ```
 """
@@ -414,7 +414,7 @@ def make_train(config: Config):
     ] == 0, "NUM_MINIBATCHES must divide NUM_STEPS*NUM_ENVS"
 
     basic_env = make_craftax_env_from_name(
-        config["ENV_NAME"], not config["USE_OPTIMISTIC_RESETS"]
+        config["ENV_NAME"], auto_reset=not config["USE_OPTIMISTIC_RESETS"]
     )
     env_params = basic_env.default_params
     log_env = LogWrapper(basic_env)
@@ -1123,6 +1123,7 @@ def main(_config):
     alg_name = config.get("ALG_NAME", "pqn_rnn")
     env_name = config["ENV_NAME"]
 
+    # todo: adjust if we want to do one task per gpu.
     jax_distributed_initialize(
         local_device_ids=list(range(distributed_env.gpus_per_task))
     )
@@ -1144,7 +1145,6 @@ def main(_config):
 
     rng = jax.random.PRNGKey(config["SEED"])
 
-    t0 = time.time()
     num_seeds = config["NUM_SEEDS"]
     # assert num_seeds % 2 == 0, "Debugging distributed stuff for now."
     # todo: figure out how to properly share / shard / split stuff.
@@ -1163,12 +1163,17 @@ def main(_config):
 
     # TODO: Add profiling hooks following https://docs.jax.dev/en/latest/profiling.html
     train_fn = make_train(config)
-    outs: Results = jax.block_until_ready(jax.jit(jax.vmap(train_fn))(rngs))
-    print(f"Took {time.time() - t0} seconds to complete.")
+    _start = time.time()
+    train_fn = jax.jit(jax.vmap(train_fn)).lower(rngs).compile()
+    print(f"Took {time.time() - _start} seconds to jit.")
+
+    _start = time.time()
+    outs: Results = jax.block_until_ready(train_fn(rngs))
+    print(f"Took {time.time() - _start} seconds to complete.")
     print(jax.tree.map(jnp.shape, outs["metrics"]))
     mean_metrics = jax.lax.pmean(outs["metrics"], ("x", "y"))
     print(jax.tree.map(jnp.shape, mean_metrics))
-    return
+
     if (save_path := config.get("SAVE_PATH")) is not None:
         model_state = outs["runner_state"][0]
         save_dir = os.path.join(save_path, env_name)

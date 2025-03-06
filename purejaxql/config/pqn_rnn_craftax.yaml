@@ -1,6 +1,19 @@
-defaults:
-  - config
-  - _self_
+# experiment params
+NUM_SEEDS: 1
+SEED: 0
+
+# if  hyperparameters tuning
+HYP_TUNE: False
+
+# wandb params
+WANDB_MODE: "disabled" # set to online to activate wandb
+ENTITY: ""
+PROJECT: ""
+alg:
+  WANDB_LOG_ALL_SEEDS: False # will log all the vmapped seeds separetely
+
+# where to save the params (if None, will not save)
+SAVE_PATH: "./models"
 
 ALG_NAME: "pqn_rnn"
 TOTAL_TIMESTEPS: 1e9
