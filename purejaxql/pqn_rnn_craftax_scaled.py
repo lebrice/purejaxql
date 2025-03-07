@@ -40,6 +40,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import rich.logging
+import yaml
 from craftax.craftax.craftax_state import EnvParams, EnvState
 from craftax.craftax_env import make_craftax_env_from_name
 from craftax_wrappers import (
@@ -55,7 +56,6 @@ from flax.training.train_state import TrainState
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax._src.distributed import initialize as jax_distributed_initialize
 from jax.nn import initializers
-from jax.sharding import NamedSharding, PartitionSpec  # noqa
 from jax_tqdm import scan_tqdm
 from omegaconf import OmegaConf
 from safetensors.flax import load_file, save_file
@@ -87,6 +87,8 @@ Axes = Union[int, Sequence[int]]
 def get_gpus_per_task(tres_per_task: str) -> int:
     """Returns the number of GPUS per task from the SLURM env variables.
 
+    >>> get_gpus_per_task('cpu=12,gres/gpu=1')
+    1
     >>> get_gpus_per_task('cpu=48,gres/gpu=4')
     4
     >>> get_gpus_per_task('cpu=48,gres/gpu=h100=2')
@@ -99,12 +101,13 @@ def get_gpus_per_task(tres_per_task: str) -> int:
     # Example: 'cpu=48,gres/gpu=4' --> 4
     # Example: 'cpu=48,gres/gpu=h100:4' --> 4
     for part in tres_per_task.split(","):
-        res_type, _, res_count = part.partition(":")
+        res_type, _, res_count = part.partition("=")
         if res_type == "gres/gpu":
-            gpus_per_task = int(res_count.rpartition("=")[-1])
+            gpus_per_task = int(res_count.rpartition(":")[-1])
+
             assert gpus_per_task > 0
             return gpus_per_task
-    return 0
+    raise NotImplementedError(f"Unknown tres_per_task format: {tres_per_task}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -294,8 +297,8 @@ class RNNQNetwork(nn.Module):
         self,
         hidden: Sequence[tuple[jax.Array, jax.Array]],
         x: jax.Array,
-        done,
-        last_action,
+        done: jax.Array,
+        last_action: jax.Array,
         train: bool = False,
     ):
         if self.norm_type == "layer_norm":
@@ -368,7 +371,7 @@ class _ExplorationState(NamedTuple):
 
 class _RunnerState(NamedTuple):
     train_state: CustomTrainState
-    # memory_transitions: Transition
+    # memory_transitions: Transition  # (removed)
     expl_state: _ExplorationState
     test_metrics: dict | None
     rng: chex.PRNGKey
@@ -501,12 +504,23 @@ def train(
     test_env: Static[BatchEnvWrapper],
 ):
     num_envs: int = config["NUM_ENVS"]
-    num_updates: int = int(config["NUM_UPDATES"])
+    num_updates = (
+        int(config["TOTAL_TIMESTEPS"]) // config["NUM_STEPS"] // config["NUM_ENVS"]
+    )
+    num_updates_decay = (
+        int(config["TOTAL_TIMESTEPS_DECAY"])
+        // config["NUM_STEPS"]
+        // config["NUM_ENVS"]
+    )
+
+    rng, actor_rng, initial_test_metrics_rng, initial_env_state_rng = jax.random.split(
+        rng, 4
+    )
 
     eps_scheduler = optax.linear_schedule(
         config["EPS_START"],
         config["EPS_FINISH"],
-        (config["EPS_DECAY"]) * config["NUM_UPDATES_DECAY"],
+        (config["EPS_DECAY"]) * num_updates_decay,
     )
 
     lr_scheduler = optax.linear_schedule(
@@ -526,12 +540,10 @@ def train(
         num_rnn_layers=config.get("NUM_RNN_LAYERS", 1),
         norm_type=config["NORM_TYPE"],
         norm_input=config.get("NORM_INPUT", False),
-        add_last_action=config.get("ADD_LAST_ACTION", False),
+        add_last_action=config.get("ADD_LAST_ACTION", False),  # True in config
     )
-    # NOTE (rng): _rng wasn't used here, renamed to _agent_rng.
-    rng, _agent_rng = jax.random.split(rng)
     train_state = create_agent(
-        _agent_rng,  # was `rng`.
+        actor_rng,
         env=env,
         env_params=env_params,
         config=config,
@@ -540,10 +552,10 @@ def train(
     )
 
     # TRAINING LOOP
-    rng, _initial_test_metrics_rng = jax.random.split(rng)
+    # todo: why test at the start?
     test_metrics = get_test_metrics(
         train_state,
-        _initial_test_metrics_rng,
+        initial_test_metrics_rng,
         config=config,
         network=network,
         test_env=test_env,
@@ -558,31 +570,11 @@ def train(
 
     # todo: Would be nice to be able to start from a checkpoint and maybe skip this step.
     assert config["MEMORY_WINDOW"] == 0
-    # NOTE Since the memory window is 0, we can skip all this memory buffer stuff!
-    # buffer_length = config["MEMORY_WINDOW"] + config["NUM_STEPS"]
-    # (expl_state, rng), memory_transitions = scan_with_progress(
-    #     lambda expl_state_and_rng, _step: random_step(
-    #         expl_state_and_rng,
-    #         _step,
-    #         network=network,
-    #         train_state=train_state,
-    #         env=env,
-    #         env_params=env_params,
-    #         num_envs=num_envs,
-    #         reward_scaling_factor=config["REW_SCALE"],
-    #     ),
-    #     init=(expl_state, rng),
-    #     xs=jnp.arange(buffer_length),
-    #     length=buffer_length,
-    #     desc="Filling up the initial buffers.",
-    # )
-
     # train
     # NOTE: rng was just unused after this, so using it directly instead of splitting.
     # rng, _rng = jax.random.split(rng)
 
-    rng, _initial_env_state_rng = jax.random.split(rng)
-    _initial_obs, _initial_env_state = env.reset(_initial_env_state_rng, env_params)
+    _initial_obs, _initial_env_state = env.reset(initial_env_state_rng, env_params)
     expl_state = _ExplorationState(
         hs=network.initialize_carry(num_envs),
         obs=_initial_obs,
@@ -590,10 +582,8 @@ def train(
         action=jnp.zeros((num_envs), dtype=int),
         env_state=_initial_env_state,
     )
-
     runner_state = _RunnerState(
         train_state,
-        # memory_transitions,
         expl_state,
         test_metrics,
         rng,  # was _rng
@@ -602,7 +592,7 @@ def train(
     # todo: Would be nice to be able restart from an existing
     # checkpoint by changing this to a jax.lax.fori_loop of some sort instead of a scan!
     current_update = 0
-    runner_state, metrics = scan_with_progress(
+    runner_state, metrics = jax.lax.scan(
         lambda runner_state, update: update_step(
             runner_state,
             update,
@@ -611,13 +601,12 @@ def train(
             env=env,
             env_params=env_params,
             eps_scheduler=eps_scheduler,
-            # original_rng=original_rng,
             test_env=test_env,
         ),
         init=runner_state,
         xs=jnp.arange(current_update, num_updates),
         length=num_updates - current_update,
-        desc="Training...",
+        # desc="Training...",
     )
 
     return Results(runner_state=runner_state, metrics=metrics)
@@ -683,7 +672,7 @@ def random_step(
 @jit
 def get_test_metrics(
     train_state: CustomTrainState,
-    rng: chex.PRNGKey,
+    test_rng: chex.PRNGKey,
     *,
     config: Static[Config],
     network: Static[RNNQNetwork],
@@ -697,8 +686,9 @@ def get_test_metrics(
     if not test_during_training:
         return None
 
-    rng, _test_rng = jax.random.split(rng)
-    init_obs, env_state = test_env.reset(_test_rng, env_params)
+    # note: `rng` was unused after this, so using the input (and renaming it to `test_env_rng` instead.)
+    # rng, _test_rng = jax.random.split(rng)
+    init_obs, env_state = test_env.reset(test_rng, env_params)
     exploration_state = _ExplorationState(
         hs=network.initialize_carry(test_num_envs),  # (n_envs, hs_size)
         obs=init_obs,
@@ -707,7 +697,8 @@ def get_test_metrics(
         env_state=env_state,
     )
 
-    (_new_exploration_state, _rng), infos = scan_with_progress(
+    # We don't care about the resulting exploration state or modified rng here. (_)
+    _, infos = jax.lax.scan(
         lambda expl_state_and_rng, _step: _greedy_env_step(
             expl_state_and_rng,
             _step,
@@ -715,17 +706,17 @@ def get_test_metrics(
             train_state=train_state,
             config=config,
             test_env=test_env,
-            test_env_rng=_test_rng,
+            test_env_rng=test_rng,
             env_params=env_params,
         ),
-        (exploration_state, _test_rng),
+        (exploration_state, test_rng),
         xs=jnp.arange(test_num_steps),  # None,
         length=test_num_steps,
-        desc="Testing...",
+        # desc="Testing...",
     )
     returned_episode = infos["returned_episode"]
     assert isinstance(returned_episode, jax.Array)
-    # return mean of done infos
+    # return mean of the infos where the episode is done.
     mean_done_infos = jax.tree.map(
         lambda x: jnp.mean(x, where=returned_episode),
         # lambda x: (x * returned_episode).sum() / returned_episode_sum,
@@ -737,7 +728,7 @@ def get_test_metrics(
 @jit
 def _greedy_env_step(
     step_state: tuple[_ExplorationState, chex.PRNGKey],
-    _step: jax.Array,
+    step: jax.Array,
     *,
     network: Static[RNNQNetwork],
     train_state: CustomTrainState,
@@ -750,8 +741,15 @@ def _greedy_env_step(
     eps_test: float = config["EPS_TEST"]
 
     expl_state, rng = step_state
+    rng, action_rng = jax.random.split(rng, 2)
+    # note: rng_s was unused.
+    # rng, action_rng, rng_s = jax.random.split(rng, 3)
+    # NOTE: Below this used to pass the same `test_env_rng` to test_env.step at every step.
+    # Here instead I'm folding in the step.
+    test_env_step_rng = jax.random.fold_in(test_env_rng, step)
+
     hs, last_obs, last_done, last_action, env_state = expl_state
-    rng, rng_a, rng_s = jax.random.split(rng, 3)
+
     _obs = last_obs[np.newaxis]  # (1 (dummy time), num_envs, obs_size)
     _done = last_done[np.newaxis]  # (1 (dummy time), num_envs)
     _last_action = last_action[np.newaxis]  # (1 (dummy time), num_envs)
@@ -770,11 +768,10 @@ def _greedy_env_step(
     q_vals = q_vals.squeeze(axis=0)  # (num_envs, num_actions) remove the time dim
     eps = jnp.full(test_num_envs, eps_test)
     new_action = jax.vmap(eps_greedy_exploration)(
-        jax.random.split(rng_a, test_num_envs), q_vals, eps
+        jax.random.split(action_rng, test_num_envs), q_vals, eps
     )
-    # TODO: Why does this use `_rng` instead of the rng that is passed in as input?
     new_obs, new_env_state, reward, new_done, info = test_env.step(
-        test_env_rng, env_state, new_action, env_params
+        test_env_step_rng, env_state, new_action, env_params
     )
     new_expl_state = _ExplorationState(
         new_hs, new_obs, new_done, new_action, new_env_state
@@ -795,7 +792,9 @@ def update_step(
 ):
     num_steps: int = config["NUM_STEPS"]  # steps per environment in each update
     num_envs: int = config["NUM_ENVS"]
-    num_epochs: int = config["NUM_EPOCHS"]  # minibatches per epoch
+    num_epochs: int = config[
+        "NUM_EPOCHS"
+    ]  # number of epochs between evaluations / logging. epoch
     num_minibatches: int = config["NUM_MINIBATCHES"]  # minibatches per epoch (also?)
     gamma: float = config["GAMMA"]
     reward_scaling_coefficient: float = config["REW_SCALE"]
@@ -803,22 +802,16 @@ def update_step(
 
     train_state, exploration_state, test_metrics, rng = runner_state
 
-    # Potential difference here: We reinitialize the envs every time, whereas
-    # before it would start from the last state
-    # _initial_obs, _initial_env_state = env.reset(env_rng, env_params)
-    # expl_state = _ExplorationState(
-    #     hs=network.initialize_carry(num_envs),
-    #     obs=_initial_obs,
-    #     done=jnp.zeros((num_envs), dtype=bool),
-    #     action=jnp.zeros((num_envs), dtype=int),
-    #     env_state=_initial_env_state,
-    # )
+    rng, actor_rng, env_rng = jax.random.split(runner_state.rng, 3)
 
     # NETWORKS UPDATE
-    (train_state, exploration_state, rng), (loss, qvals, infos) = jax.lax.scan(
-        lambda train_state_expl_state_and_rng, epoch: learn_epoch(
-            train_state_expl_state_and_rng,
+    # Perform `num_epochs` "epochs" (collecting data + multiple updates).
+    (train_state, exploration_state), (loss, qvals, infos) = jax.lax.scan(
+        lambda train_state_and_expl_state, epoch: learn_epoch(
+            train_state_and_expl_state,
             epoch,
+            env_rng=env_rng,
+            actor_rng=actor_rng,
             network=network,
             num_minibatches=num_minibatches,
             gamma=gamma,
@@ -830,7 +823,7 @@ def update_step(
             reward_scaling_coefficient=reward_scaling_coefficient,
             num_steps_per_update=num_steps,
         ),
-        init=(train_state, exploration_state, rng),
+        init=(train_state, exploration_state),
         xs=jnp.arange(num_epochs),
         length=num_epochs,
         # desc="Updating networks...",
@@ -846,22 +839,18 @@ def update_step(
 
     assert isinstance(loss, jax.Array)
     assert isinstance(qvals, jax.Array)
+    returned_episode = infos["returned_episode"]
+    assert isinstance(returned_episode, jax.Array)
+    done_infos = jax.tree.map(lambda x: jnp.mean(x, where=returned_episode), infos)
+
     metrics = {
         "env_step": train_state.timesteps,
         "update_steps": train_state.n_updates,
         "grad_steps": train_state.grad_steps,
         "td_loss": loss.mean(),
         "qvals": qvals.mean(),
+        **done_infos,
     }
-    returned_episode = infos["returned_episode"]
-    assert isinstance(returned_episode, jax.Array)
-
-    done_infos = jax.tree.map(
-        lambda x: jnp.mean(x, where=returned_episode),
-        # lambda x: (x * returned_episode).sum() / infos["returned_episode"].sum(),
-        infos,
-    )
-    metrics.update(done_infos)
 
     # TODO: bad. Should be happening in a scan or something similar, no?
     # if config.get("TEST_DURING_TRAINING", False):
@@ -884,8 +873,8 @@ def update_step(
     #     metrics.update({f"test_{k}": v for k, v in test_metrics.items()})
 
     # remove achievement metrics if not logging them
-    if not config.get("LOG_ACHIEVEMENTS", False):
-        metrics = {k: v for k, v in metrics.items() if "achievement" not in k.lower()}
+    # if not config.get("LOG_ACHIEVEMENTS", False):
+    #     metrics = {k: v for k, v in metrics.items() if "achievement" not in k.lower()}
 
     # report on wandb if required
     # if config["WANDB_MODE"] != "disabled" and jax.process_index() == 0:
@@ -912,7 +901,8 @@ def update_step(
 
 def collect_transitions_and_update_buffer(
     exploration_state: _ExplorationState,
-    rng: chex.PRNGKey,
+    actor_rng: chex.PRNGKey,
+    env_rng: chex.PRNGKey,
     num_steps: int,
     transition_buffer: Transition,
     network: Static[RNNQNetwork],
@@ -923,10 +913,12 @@ def collect_transitions_and_update_buffer(
     num_envs: Static[int],
     reward_scaling_coefficient: float = 1.0,
 ):
-    (exploration_state, rng), (_transitions, infos) = jax.lax.scan(
-        lambda expl_state_and_rng, _step: step_env(
-            expl_state_and_rng,
-            _step,
+    exploration_state, (_transitions, infos) = jax.lax.scan(
+        lambda expl_state, step: step_env(
+            expl_state,
+            step,
+            action_selection_rng=actor_rng,
+            env_step_rng=env_rng,
             network=network,
             train_state=train_state,
             eps_scheduler=eps_scheduler,
@@ -935,7 +927,7 @@ def collect_transitions_and_update_buffer(
             num_envs=num_envs,
             reward_scaling_coefficient=reward_scaling_coefficient,
         ),
-        init=(exploration_state, rng),
+        init=exploration_state,
         xs=jnp.arange(num_steps),  # None
         length=num_steps,
     )
@@ -949,9 +941,11 @@ def collect_transitions_and_update_buffer(
 
 @jit
 def learn_epoch(
-    carry: tuple[CustomTrainState, _ExplorationState, chex.PRNGKey],
-    _epoch: jax.Array,
+    carry: tuple[CustomTrainState, _ExplorationState],
+    epoch: jax.Array,
     *,
+    env_rng: chex.PRNGKey,
+    actor_rng: chex.PRNGKey,
     num_minibatches: Static[int],
     network: Static[RNNQNetwork],
     gamma: float,
@@ -963,34 +957,43 @@ def learn_epoch(
     reward_scaling_coefficient: float,
     num_steps_per_update: Static[int],
 ):
-    train_state, expl_state, rng = carry
+    train_state, expl_state = carry
 
-    rng, shuffle_transitions_key = jax.random.split(rng)
+    # Keys for environment stepping and shuffling transitions from a base key + epoch
+    env_rng, shuffle_transitions_key = jax.random.split(
+        jax.random.fold_in(env_rng, epoch)
+    )
+    # Keys for selecting actions
+    actor_rng = jax.random.fold_in(actor_rng, epoch)
 
-    (expl_state, rng), (transitions, infos) = jax.lax.scan(
-        lambda expl_state_and_rng, _step: step_env(
-            expl_state_and_rng,
-            _step,
+    # Collect `num_steps_per_update * num_envs` transitions
+    expl_state, (transitions, infos) = jax.lax.scan(
+        lambda expl_state, step: step_env(
+            expl_state,
+            step,
+            action_selection_rng=actor_rng,
             network=network,
             train_state=train_state,
             eps_scheduler=eps_scheduler,
             env=env,
             env_params=env_params,
             num_envs=num_envs,
+            env_step_rng=env_rng,
             reward_scaling_coefficient=reward_scaling_coefficient,
         ),
-        init=(expl_state, rng),
+        init=expl_state,
         xs=jnp.arange(num_steps_per_update),  # None
         length=num_steps_per_update,
     )
 
     # Shuffle and reshape into (minibatches, num_steps, batch_size/num_minbatches, ...)
-    transitions = jax.tree_util.tree_map(
+    shuffled_transitions_minibatches = jax.tree_util.tree_map(
         lambda x: preprocess_transition(
-            x, shuffle_transitions_key, num_minibatches=num_minibatches
+            x, shuffle_rng=shuffle_transitions_key, num_minibatches=num_minibatches
         ),
         transitions,
     )
+    # Perform `num_minibatches` updates
     train_state, (loss, qvals) = jax.lax.scan(
         lambda train_state, minibatch: update_network(
             train_state,
@@ -1000,15 +1003,18 @@ def learn_epoch(
             lambda_=lambda_,
         ),
         init=train_state,
-        xs=transitions,
+        xs=shuffled_transitions_minibatches,
+        length=num_minibatches,
     )
+    assert isinstance(loss, jax.Array)
+    assert isinstance(qvals, jax.Array)
 
-    return (train_state, expl_state, rng), (loss, qvals, infos)
+    return (train_state, expl_state), (loss, qvals, infos)
 
 
 @jit
 def update_network(
-    carry: CustomTrainState,
+    train_state: CustomTrainState,
     minibatch: Transition,
     *,
     network: Static[RNNQNetwork],
@@ -1020,7 +1026,7 @@ def update_network(
 
     # NOTE: `rng` isn't used here (at all!), removed.
     # train_state, rng = carry
-    train_state = carry
+    train_state = train_state
 
     # hs of oldest step (batch_size, hidden_size)
     hs = jax.tree.map(lambda x: x[0], minibatch.last_hs)
@@ -1045,8 +1051,12 @@ def update_network(
     )(train_state.params)
 
     # TODO: Rearrange this whole thing to be simpler, like in Stoix repo.
-    # grads = jax.lax.pmean(grads, axis_name="devices")
-
+    grads = jax.lax.pmean(grads, axis_name="devices")
+    # todo: would we also need to sync the batch stats here?
+    # updates["batch_stats"] = jax.lax.pmean(updates["batch_stats"], axis_name="devices")
+    # TODO: this increases `train_state.step` by 1, but we also increase it manually elsewhere!
+    # TODO: Idea: How about syncing (pmean) between devices on the same node after each update here,
+    # and then syncing after each "epoch" between nodes? Would that make sense?
     train_state = train_state.apply_gradients(grads=grads)
     train_state = train_state.replace(
         grad_steps=train_state.grad_steps + 1,
@@ -1140,74 +1150,107 @@ def _get_target(
 
 
 @jit
-def preprocess_transition(x: jax.Array, rng: jax.Array, num_minibatches: Static[int]):
+def preprocess_transition(
+    x: jax.Array, shuffle_rng: jax.Array, num_minibatches: Static[int]
+):
     # x: (num_steps, num_envs, ...)
     return (
-        jax.random.permutation(rng, x, axis=1)  # shuffle the transitions
-        # num_steps, minibatches, batch_size/num_minbatches, ...
+        jax.random.permutation(shuffle_rng, x, axis=1)  # shuffle the transitions
+        # num_steps, num_minibatches, batch_size/num_minbatches, ...
         .reshape(x.shape[0], num_minibatches, -1, *x.shape[2:])
-        # (minibatches, num_steps, batch_size/num_minbatches, ...)
+        # (num_minibatches, num_steps, batch_size/num_minbatches, ...)
         .swapaxes(0, 1)
     )
 
 
+def get_action_and_q_values(
+    hs: jax.Array,
+    obs: jax.Array,
+    done: jax.Array,
+    last_action: jax.Array,
+    network: RNNQNetwork,
+    train_state: CustomTrainState,
+    eps_scheduler: optax.Schedule,
+    num_envs: int,
+    action_selection_rng: chex.PRNGKey,
+):
+    obs = obs[np.newaxis]  # (1 (dummy time), num_envs, obs_size)
+    done = done[np.newaxis]  # (1 (dummy time), num_envs)
+    last_action = last_action[np.newaxis]  # (1 (dummy time), num_envs)
+
+    # (num_envs, hidden_size), (1, num_envs, num_actions)
+    new_hs, q_vals = network.apply(
+        {
+            "params": train_state.params,
+            "batch_stats": train_state.batch_stats,
+        },
+        hidden=hs,
+        x=obs,
+        done=done,
+        last_action=last_action,
+        train=False,
+    )
+    assert isinstance(q_vals, jax.Array)
+    q_vals = q_vals.squeeze(axis=0)  # (num_envs, num_actions) remove the time dim
+
+    epsilon = eps_scheduler(train_state.n_updates)
+
+    new_action = jax.vmap(eps_greedy_exploration)(
+        jax.random.split(action_selection_rng, num_envs),
+        q_vals,
+        eps=jnp.full(num_envs, epsilon),
+    )
+    return new_action, q_vals, new_hs
+
+
 @jit
 def step_env(
-    carry: tuple[_ExplorationState, chex.PRNGKey],
-    _step: jax.Array,
+    carry: _ExplorationState,
+    step: jax.Array,
     *,
+    action_selection_rng: chex.PRNGKey,
     network: Static[RNNQNetwork],
     train_state: CustomTrainState,
     eps_scheduler: Static[optax.Schedule],
     env: Static[BatchEnvWrapper | OptimisticResetVecEnvWrapper],
     env_params: Static[EnvParams],
     num_envs: Static[int],
+    env_step_rng: chex.PRNGKey,
     reward_scaling_coefficient: float = 1.0,
 ):
-    _exploration_state, rng = carry
-    hs, last_obs, last_done, last_action, env_state = _exploration_state
-    rng, rng_a, rng_s = jax.random.split(rng, 3)
+    exploration_state = carry
+    last_hs, last_obs, last_done, last_action, env_state = exploration_state
 
-    _obs = last_obs[np.newaxis]  # (1 (dummy time), num_envs, obs_size)
-    _done = last_done[np.newaxis]  # (1 (dummy time), num_envs)
-    _last_action = last_action[np.newaxis]  # (1 (dummy time), num_envs)
+    action_selection_rng = jax.random.fold_in(action_selection_rng, step)
+    env_step_rng = jax.random.fold_in(env_step_rng, step)
 
-    new_hs, q_vals = network.apply(
-        {
-            "params": train_state.params,
-            "batch_stats": train_state.batch_stats,
-        },
-        hs,
-        _obs,
-        _done,
-        _last_action,
-        train=False,
-    )  # (num_envs, hidden_size), (1, num_envs, num_actions)
-    assert isinstance(q_vals, jax.Array)
-    q_vals = q_vals.squeeze(axis=0)  # (num_envs, num_actions) remove the time dim
-
-    _env_rngs = jax.random.split(rng_a, num_envs)
-    eps = jnp.full(num_envs, eps_scheduler(train_state.n_updates))
-    new_action = jax.vmap(eps_greedy_exploration)(_env_rngs, q_vals, eps)
-
-    new_obs, new_env_state, reward, new_done, info = env.step(
-        rng_s, env_state, new_action, env_params
+    action, q_vals, new_hs = get_action_and_q_values(
+        hs=last_hs,
+        obs=last_obs,
+        done=last_done,
+        last_action=last_action,
+        network=network,
+        train_state=train_state,
+        eps_scheduler=eps_scheduler,
+        num_envs=num_envs,
+        action_selection_rng=action_selection_rng,
     )
 
+    new_obs, new_env_state, reward, new_done, info = env.step(
+        env_step_rng, env_state, action, env_params
+    )
     transition = Transition(
-        last_hs=hs,
-        obs=last_obs,
-        action=new_action,
+        last_hs=last_hs,
+        obs=last_obs,  # doesn't store the next observation, interesting.
+        action=action,
         reward=reward_scaling_coefficient * reward,
         done=new_done,
         last_done=last_done,
         last_action=last_action,
         q_vals=q_vals,
     )
-    new_expl_state = _ExplorationState(
-        new_hs, new_obs, new_done, new_action, new_env_state
-    )
-    return (new_expl_state, rng), (transition, info)
+    new_expl_state = _ExplorationState(new_hs, new_obs, new_done, action, new_env_state)
+    return new_expl_state, (transition, info)
 
 
 @jit
@@ -1244,16 +1287,17 @@ def create_agent(
 
 # epsilon-greedy exploration
 def eps_greedy_exploration(rng: chex.PRNGKey, q_vals: jax.Array, eps: jax.Array):
-    rng_a, rng_e = jax.random.split(
-        rng
-    )  # a key for sampling random actions and one for picking
+    # a key for sampling random actions and one for picking
+    rng_a, rng_e = jax.random.split(rng)
     greedy_actions = jnp.argmax(q_vals, axis=-1)
     chosed_actions = jnp.where(
-        jax.random.uniform(rng_e, greedy_actions.shape)
-        < eps,  # pick the actions that should be random
+        # pick the actions that should be random
+        jax.random.uniform(rng_e, greedy_actions.shape) < eps,
+        # sample random actions
+        # todo: shouldn't this use the action space from the environment instead?
         jax.random.randint(
             rng_a, shape=greedy_actions.shape, minval=0, maxval=q_vals.shape[-1]
-        ),  # sample random actions,
+        ),
         greedy_actions,
     )
     return chosed_actions
@@ -1299,12 +1343,13 @@ def setup_logging(local_rank: int, num_processes: int, verbose: int):
 
 @hydra.main(version_base=None, config_path="./config", config_name="pqn_rnn_craftax")
 def main(_config):
-    distributed_env = SlurmDistributedEnv()
-    setup_logging(distributed_env.local_rank, distributed_env.num_nodes, 2)
+    dist_env = SlurmDistributedEnv()
+    setup_logging(dist_env.local_rank, dist_env.num_nodes, 2)
 
     _config = OmegaConf.to_container(_config)
     assert isinstance(_config, dict)
-    if distributed_env.global_rank == 0:
+    if dist_env.global_rank == 0:
+        print("Distributed env:\n", yaml.dump(dataclasses.asdict(dist_env)))
         print("Config:\n", OmegaConf.to_yaml(_config))
 
     # todo: This pattern is bad, why is there even an `alg` config group? Makes no sense.
@@ -1318,10 +1363,10 @@ def main(_config):
     #         (distributed_env.local_rank + 1) * distributed_env.gpus_per_task,
     #     )
     # )
-    task_gpus = list(range(distributed_env.gpus_per_task))
+    task_gpus = list(range(dist_env.gpus_per_task))
     # todo: adjust if we want to do one task per gpu.
     jax_distributed_initialize(local_device_ids=task_gpus)
-
+    logger.info(f"{jax.devices()=}, {jax.local_devices()=}")
     _run = wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
@@ -1331,8 +1376,8 @@ def main(_config):
             f"jax_{jax.__version__}",
         ],
         name=config.get("NAME", f"{config['ALG_NAME']}_{config['ENV_NAME']}"),
-        id=f"{distributed_env.job_id}_{distributed_env.global_rank}",
-        group=str(distributed_env.job_id),
+        id=f"{dist_env.job_id}_{dist_env.global_rank}",
+        group=str(dist_env.job_id),
         config=dict(config),
         mode=config["WANDB_MODE"],
     )
@@ -1356,9 +1401,22 @@ def main(_config):
 
     rngs = rng
 
-    # todo: makes no sense, each function gets the same arguments, so produces the same data!
-    # train_fn = jax.pmap(train_fn, axis_name="devices", devices=jax.devices())
-    # rngs = jax.random.split(rng, len(jax.devices()))
+    # from jax.experimental.shard_map import shard_map
+    # from jax.sharding import PartitionSpec as P
+    # from jax.sharding import NamedSharding
+
+    # mesh = jax.make_mesh((dist_env.num_tasks * dist_env.gpus_per_task,), ("devices"))
+    # assert jax.device_count() == (dist_env.num_tasks * dist_env.gpus_per_task)
+
+    # train_fn = shard_map(
+    #     train_fn,
+    #     mesh=mesh,
+    #     in_specs=P("devices"),
+    #     out_specs=P(None),
+    # )
+    # rngs = jax.random.split(rng, (dist_env.num_tasks * dist_env.gpus_per_task))
+    # rngs = jax.device_put(rngs, NamedSharding(mesh, P("devices")))
+    # jax.debug.visualize_array_sharding(rngs)
 
     train_fn = jax.jit(train_fn).lower(rngs).compile()
     logger.info(f"Took {time.time() - _start} seconds to jit.")
@@ -1367,6 +1425,14 @@ def main(_config):
     outs: Results = jax.block_until_ready(train_fn(rngs))
     logger.info(f"Took {time.time() - _start} seconds to complete.")
     print(jax.tree.map(jnp.shape, outs["metrics"]))
+    print(
+        *[
+            f"{k}: {v}"
+            for k, v in outs["metrics"].items()
+            if not k.startswith("Achievements")
+        ],
+        sep="\n",
+    )
 
     # mean_metrics = jax.lax.pmean(outs["metrics"], ("x", "y"))
     # print(jax.tree.map(jnp.shape, mean_metrics))

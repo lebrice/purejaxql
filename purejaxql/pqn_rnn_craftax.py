@@ -2,31 +2,30 @@
 This script uses BatchRenorm for more effective batch normalization in long training runs.
 """
 
+import copy
 import os
 import time
-import copy
+from functools import partial
+from typing import Any, Callable, Optional, Sequence, Tuple, Union
+
+import chex
+import flax.linen as nn
+import hydra
 import jax
 import jax.numpy as jnp
 import numpy as np
-from functools import partial
-from typing import Any
-
-import chex
 import optax
-import flax.linen as nn
-from flax.training.train_state import TrainState
-import hydra
-from omegaconf import OmegaConf
-import wandb
-
 from craftax.craftax_env import make_craftax_env_from_name
-from craftax_wrappers import LogWrapper, OptimisticResetVecEnvWrapper, BatchEnvWrapper
-
-from flax.linen.normalization import _compute_stats, _normalize, _canonicalize_axes
-from typing import Callable, Optional, Sequence, Tuple, Union
+from craftax_wrappers import BatchEnvWrapper, LogWrapper, OptimisticResetVecEnvWrapper
 from flax.linen.module import Module, compact, merge_param
+from flax.linen.normalization import _canonicalize_axes, _compute_stats, _normalize
+from flax.training.train_state import TrainState
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.nn import initializers
+from omegaconf import OmegaConf
+from safetensors.flax import load_file, save_file
 
+import wandb
 
 PRNGKey = Any
 Array = Any
@@ -770,13 +769,13 @@ def single_run(config):
 
     t0 = time.time()
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    train_vjit = jax.jit(jax.vmap(make_train(config)))
+    train_vjit = jax.jit(jax.vmap(make_train(config))).lower(rngs).compile()
+    print(f"Took {time.time() - t0} seconds to JIT.")
+    t0 = time.time()
     outs = jax.block_until_ready(train_vjit(rngs))
     print(f"Took {time.time() - t0} seconds to complete.")
 
     if config.get("SAVE_PATH", None) is not None:
-        from jaxmarl.wrappers.baselines import save_params
-
         model_state = outs["runner_state"][0]
         save_dir = os.path.join(config["SAVE_PATH"], env_name)
         os.makedirs(save_dir, exist_ok=True)
@@ -841,6 +840,16 @@ def tune(default_config):
         sweep_config, entity=default_config["ENTITY"], project=default_config["PROJECT"]
     )
     wandb.agent(sweep_id, wrapped_make_train, count=1000)
+
+
+def save_params(params: dict, filename: str | os.PathLike) -> None:
+    flattened_dict = flatten_dict(params, sep=",")
+    save_file(flattened_dict, filename)  # type: ignore
+
+
+def load_params(filename: str | os.PathLike) -> dict:
+    flattened_dict = load_file(filename)
+    return unflatten_dict(flattened_dict, sep=",")
 
 
 @hydra.main(version_base=None, config_path="./config", config_name="config")
