@@ -803,10 +803,21 @@ def update_step(
 
     train_state, exploration_state, test_metrics, rng = runner_state
 
+    # Potential difference here: We reinitialize the envs every time, whereas
+    # before it would start from the last state
+    # _initial_obs, _initial_env_state = env.reset(env_rng, env_params)
+    # expl_state = _ExplorationState(
+    #     hs=network.initialize_carry(num_envs),
+    #     obs=_initial_obs,
+    #     done=jnp.zeros((num_envs), dtype=bool),
+    #     action=jnp.zeros((num_envs), dtype=int),
+    #     env_state=_initial_env_state,
+    # )
+
     # NETWORKS UPDATE
-    (train_state, rng), (loss, qvals, infos) = jax.lax.scan(
-        lambda train_state_and_rng, epoch: learn_epoch(
-            train_state_and_rng,
+    (train_state, exploration_state, rng), (loss, qvals, infos) = jax.lax.scan(
+        lambda train_state_expl_state_and_rng, epoch: learn_epoch(
+            train_state_expl_state_and_rng,
             epoch,
             network=network,
             num_minibatches=num_minibatches,
@@ -819,7 +830,7 @@ def update_step(
             reward_scaling_coefficient=reward_scaling_coefficient,
             num_steps_per_update=num_steps,
         ),
-        init=(train_state, rng),
+        init=(train_state, exploration_state, rng),
         xs=jnp.arange(num_epochs),
         length=num_epochs,
         # desc="Updating networks...",
@@ -938,7 +949,7 @@ def collect_transitions_and_update_buffer(
 
 @jit
 def learn_epoch(
-    carry: tuple[CustomTrainState, chex.PRNGKey],
+    carry: tuple[CustomTrainState, _ExplorationState, chex.PRNGKey],
     _epoch: jax.Array,
     *,
     num_minibatches: Static[int],
@@ -952,18 +963,10 @@ def learn_epoch(
     reward_scaling_coefficient: float,
     num_steps_per_update: Static[int],
 ):
-    train_state, rng = carry
+    train_state, expl_state, rng = carry
 
-    rng, env_rng, shuffle_transitions_key = jax.random.split(rng, 3)
+    rng, shuffle_transitions_key = jax.random.split(rng)
 
-    _initial_obs, _initial_env_state = env.reset(env_rng, env_params)
-    expl_state = _ExplorationState(
-        hs=network.initialize_carry(num_envs),
-        obs=_initial_obs,
-        done=jnp.zeros((num_envs), dtype=bool),
-        action=jnp.zeros((num_envs), dtype=int),
-        env_state=_initial_env_state,
-    )
     (expl_state, rng), (transitions, infos) = jax.lax.scan(
         lambda expl_state_and_rng, _step: step_env(
             expl_state_and_rng,
@@ -1000,7 +1003,7 @@ def learn_epoch(
         xs=transitions,
     )
 
-    return (train_state, rng), (loss, qvals, infos)
+    return (train_state, expl_state, rng), (loss, qvals, infos)
 
 
 @jit
@@ -1139,14 +1142,13 @@ def _get_target(
 @jit
 def preprocess_transition(x: jax.Array, rng: jax.Array, num_minibatches: Static[int]):
     # x: (num_steps, num_envs, ...)
-    x = jax.random.permutation(rng, x, axis=1)  # shuffle the transitions
-    x = x.reshape(
-        x.shape[0], num_minibatches, -1, *x.shape[2:]
-    )  # num_steps, minibatches, batch_size/num_minbatches,
-    x = jnp.swapaxes(
-        x, 0, 1
-    )  # (minibatches, num_steps, batch_size/num_minbatches, ...)
-    return x
+    return (
+        jax.random.permutation(rng, x, axis=1)  # shuffle the transitions
+        # num_steps, minibatches, batch_size/num_minbatches, ...
+        .reshape(x.shape[0], num_minibatches, -1, *x.shape[2:])
+        # (minibatches, num_steps, batch_size/num_minbatches, ...)
+        .swapaxes(0, 1)
+    )
 
 
 @jit
@@ -1184,9 +1186,9 @@ def step_env(
     assert isinstance(q_vals, jax.Array)
     q_vals = q_vals.squeeze(axis=0)  # (num_envs, num_actions) remove the time dim
 
-    _rngs = jax.random.split(rng_a, num_envs)
+    _env_rngs = jax.random.split(rng_a, num_envs)
     eps = jnp.full(num_envs, eps_scheduler(train_state.n_updates))
-    new_action = jax.vmap(eps_greedy_exploration)(_rngs, q_vals, eps)
+    new_action = jax.vmap(eps_greedy_exploration)(_env_rngs, q_vals, eps)
 
     new_obs, new_env_state, reward, new_done, info = env.step(
         rng_s, env_state, new_action, env_params
