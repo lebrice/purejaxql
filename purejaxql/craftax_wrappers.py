@@ -1,16 +1,28 @@
+from __future__ import annotations
+
+import typing
+from functools import partial
+from typing import Any, Union
+
+import chex
 import jax
 import jax.numpy as jnp
-import chex
-import numpy as np
 from flax import struct
-from functools import partial
-from typing import Optional, Tuple, Union, Any
+
+if typing.TYPE_CHECKING:
+    from craftax.craftax.craftax_state import EnvParams, EnvState
+    from craftax.craftax.envs.craftax_symbolic_env import (  # noqa
+        CraftaxSymbolicEnv,
+        CraftaxSymbolicEnvNoAutoReset,
+    )
 
 
 class GymnaxWrapper(object):
     """Base class for Gymnax wrappers."""
 
-    def __init__(self, env):
+    def __init__(
+        self, env: CraftaxSymbolicEnv | CraftaxSymbolicEnvNoAutoReset | LogWrapper
+    ):
         self._env = env
 
     # provide proxy access to regular attributes of wrapped object
@@ -21,7 +33,11 @@ class GymnaxWrapper(object):
 class BatchEnvWrapper(GymnaxWrapper):
     """Batches reset and step functions"""
 
-    def __init__(self, env, num_envs: int):
+    def __init__(
+        self,
+        env: CraftaxSymbolicEnv | CraftaxSymbolicEnvNoAutoReset | LogWrapper,
+        num_envs: int,
+    ):
         super().__init__(env)
 
         self.num_envs = num_envs
@@ -37,7 +53,13 @@ class BatchEnvWrapper(GymnaxWrapper):
         return obs, env_state
 
     @partial(jax.jit, static_argnums=(0, 4))
-    def step(self, rng, state, action, params=None):
+    def step(
+        self,
+        rng: jax.Array,
+        state: EnvState,
+        action: jax.Array,
+        params: EnvParams | None = None,
+    ):
         rng, _rng = jax.random.split(rng)
         rngs = jax.random.split(_rng, self.num_envs)
         obs, state, reward, done, info = self.step_fn(rngs, state, action, params)
@@ -52,11 +74,17 @@ class AutoResetEnvWrapper(GymnaxWrapper):
         super().__init__(env)
 
     @partial(jax.jit, static_argnums=(0, 2))
-    def reset(self, key, params=None):
+    def reset(self, key: jax.Array, params: EnvParams | None = None):
         return self._env.reset(key, params)
 
     @partial(jax.jit, static_argnums=(0, 4))
-    def step(self, rng, state, action, params=None):
+    def step(
+        self,
+        rng: jax.Array,
+        state: EnvState,
+        action: jax.Array,
+        params: EnvParams | None = None,
+    ):
         rng, _rng = jax.random.split(rng)
         obs_st, state_st, reward, done, info = self._env.step(
             _rng, state, action, params
@@ -87,7 +115,12 @@ class OptimisticResetVecEnvWrapper(GymnaxWrapper):
     chance of duplicate resets.
     """
 
-    def __init__(self, env, num_envs: int, reset_ratio: int):
+    def __init__(
+        self,
+        env: "CraftaxSymbolicEnvNoAutoReset | LogWrapper",
+        num_envs: int,
+        reset_ratio: int,
+    ):
         super().__init__(env)
 
         self.num_envs = num_envs
@@ -101,14 +134,20 @@ class OptimisticResetVecEnvWrapper(GymnaxWrapper):
         self.step_fn = jax.vmap(self._env.step, in_axes=(0, 0, 0, None))
 
     @partial(jax.jit, static_argnums=(0, 2))
-    def reset(self, rng, params=None):
+    def reset(self, rng: jax.Array, params: EnvParams | None = None):
         rng, _rng = jax.random.split(rng)
         rngs = jax.random.split(_rng, self.num_envs)
         obs, env_state = self.reset_fn(rngs, params)
         return obs, env_state
 
     @partial(jax.jit, static_argnums=(0, 4))
-    def step(self, rng, state, action, params=None):
+    def step(
+        self,
+        rng: jax.Array,
+        state: EnvState,
+        action: jax.Array,
+        params: EnvParams | None = None,
+    ):
         rng, _rng = jax.random.split(rng)
         rngs = jax.random.split(_rng, self.num_envs)
         obs_st, state_st, reward, done, info = self.step_fn(rngs, state, action, params)
@@ -163,7 +202,7 @@ class LogWrapper(GymnaxWrapper):
         super().__init__(env)
 
     @partial(jax.jit, static_argnums=(0, 2))
-    def reset(self, key: chex.PRNGKey, params=None):
+    def reset(self, key: chex.PRNGKey, params: EnvParams | None = None):
         obs, env_state = self._env.reset(key, params)
         state = LogEnvState(env_state, 0.0, 0, 0.0, 0, 0)
         return obs, state
@@ -172,9 +211,9 @@ class LogWrapper(GymnaxWrapper):
     def step(
         self,
         key: chex.PRNGKey,
-        state,
+        state: LogEnvState,
         action: Union[int, float],
-        params=None,
+        params: EnvParams | None = None,
     ):
         obs, env_state, reward, done, info = self._env.step(
             key, state.env_state, action, params

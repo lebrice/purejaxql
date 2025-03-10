@@ -7,12 +7,15 @@ JAX_TRACEBACK_FILTERING=off srun --pty --nodes=1 --ntasks-per-node=1 --gpus-per-
 ```
 """
 
+from __future__ import annotations
+
 import copy
 import dataclasses
 import functools
 import logging
 import os
 import time
+import typing
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -36,16 +39,15 @@ import jax
 import jax.distributed
 import jax.experimental
 import jax.experimental.mesh_utils
+import jax.experimental.shard_map
 import jax.numpy as jnp
 import numpy as np
 import optax
 import rich.logging
 import yaml
-from craftax.craftax.craftax_state import EnvParams, EnvState
 from craftax.craftax_env import make_craftax_env_from_name
 from craftax_wrappers import (
     BatchEnvWrapper,
-    GymnaxWrapper,
     LogWrapper,
     OptimisticResetVecEnvWrapper,
 )
@@ -56,6 +58,9 @@ from flax.training.train_state import TrainState
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax._src.distributed import initialize as jax_distributed_initialize
 from jax.nn import initializers
+from jax.sharding import Mesh, NamedSharding, PartitionSpec  # noqa
+
+# from jax.sharding import NamedSharding, PartitionSpec  # noqa
 from jax_tqdm import scan_tqdm
 from omegaconf import OmegaConf
 from safetensors.flax import load_file, save_file
@@ -63,6 +68,16 @@ from typing_extensions import NotRequired
 from xtils.jitpp import Static, jit
 
 import wandb
+
+if typing.TYPE_CHECKING:
+    from craftax.craftax.craftax_state import EnvParams, EnvState
+    from craftax.craftax.envs.craftax_symbolic_env import (  # noqa
+        CraftaxSymbolicEnv,
+        CraftaxSymbolicEnvNoAutoReset,
+    )
+else:
+    EnvParams, EnvState = None, None
+
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +154,7 @@ class SlurmDistributedEnv:
         default_factory=lambda: get_gpus_per_task(os.environ["SLURM_TRES_PER_TASK"])
         or int(os.environ["SLURM_GPUS_ON_NODE"])
     )
-    node_id: int = dataclasses.field(
+    node_index: int = dataclasses.field(
         default_factory=lambda: int(os.environ["SLURM_NODEID"])
     )
     node_list: tuple[str, ...] = dataclasses.field(
@@ -428,51 +443,6 @@ class Config(TypedDict):
     TEST_NUM_STEPS: int
 
 
-def make_train(config: Config):
-    config = copy.deepcopy(config)
-    config["NUM_UPDATES"] = (
-        int(config["TOTAL_TIMESTEPS"]) // config["NUM_STEPS"] // config["NUM_ENVS"]
-    )
-
-    config["NUM_UPDATES_DECAY"] = (
-        int(config["TOTAL_TIMESTEPS_DECAY"])
-        // config["NUM_STEPS"]
-        // config["NUM_ENVS"]
-    )
-
-    assert (config["NUM_STEPS"] * config["NUM_ENVS"]) % config[
-        "NUM_MINIBATCHES"
-    ] == 0, "NUM_MINIBATCHES must divide NUM_STEPS*NUM_ENVS"
-
-    basic_env = make_craftax_env_from_name(
-        config["ENV_NAME"], auto_reset=not config["USE_OPTIMISTIC_RESETS"]
-    )
-    env_params = basic_env.default_params
-    log_env = LogWrapper(basic_env)
-    if config["USE_OPTIMISTIC_RESETS"]:
-        env = OptimisticResetVecEnvWrapper(
-            log_env,
-            num_envs=config["NUM_ENVS"],
-            reset_ratio=min(config["OPTIMISTIC_RESET_RATIO"], config["NUM_ENVS"]),
-        )
-        test_env = OptimisticResetVecEnvWrapper(
-            log_env,
-            num_envs=config["TEST_NUM_ENVS"],
-            reset_ratio=min(config["OPTIMISTIC_RESET_RATIO"], config["TEST_NUM_ENVS"]),
-        )
-    else:
-        env = BatchEnvWrapper(log_env, num_envs=config["NUM_ENVS"])
-        test_env = BatchEnvWrapper(log_env, num_envs=config["TEST_NUM_ENVS"])
-
-    return functools.partial(
-        train,
-        config=FrozenDict(config),
-        env=env,
-        env_params=env_params,
-        test_env=test_env,
-    )
-
-
 def scan_with_progress[
     Carry,
     In: int | jax.Array | tuple[int | jax.Array, ...],
@@ -495,14 +465,40 @@ def scan_with_progress[
     )
 
 
-@jit  # called once per node?
+# @jit  # called once per node?
 def train(
-    rng: chex.PRNGKey,
+    rng: chex.PRNGKey,  # global base rng (same on all nodes and tasks).
     config: Static[Config],
-    env: Static[OptimisticResetVecEnvWrapper],
+    basic_env: Static[CraftaxSymbolicEnv | CraftaxSymbolicEnvNoAutoReset],
     env_params: Static[EnvParams],
-    test_env: Static[BatchEnvWrapper],
+    # dist_env: Static[SlurmDistributedEnv],
 ):
+    # this way `per_node_rng` and `per_task_rng` are guaranteed to be different.
+    # per_node_rng = jax.random.fold_in(rng, jax.process_index())
+    per_task_rng = jax.random.fold_in(rng, jax.process_index())
+
+    mesh = jax.make_mesh((jax.device_count(),), ("batch"))
+    per_node_sharding = NamedSharding(mesh, PartitionSpec("batch"))
+    replicated_sharding = NamedSharding(mesh, PartitionSpec())
+
+    log_env = LogWrapper(basic_env)
+
+    # TODO: really wish that we didn't have to use this. The code in there is pretty confusing.
+    if config["USE_OPTIMISTIC_RESETS"]:
+        env = OptimisticResetVecEnvWrapper(
+            log_env,
+            num_envs=config["NUM_ENVS"],
+            reset_ratio=min(config["OPTIMISTIC_RESET_RATIO"], config["NUM_ENVS"]),
+        )
+        test_env = OptimisticResetVecEnvWrapper(
+            log_env,
+            num_envs=config["TEST_NUM_ENVS"],
+            reset_ratio=min(config["OPTIMISTIC_RESET_RATIO"], config["TEST_NUM_ENVS"]),
+        )
+    else:
+        env = BatchEnvWrapper(log_env, num_envs=config["NUM_ENVS"])
+        test_env = BatchEnvWrapper(log_env, num_envs=config["TEST_NUM_ENVS"])
+
     num_envs: int = config["NUM_ENVS"]
     num_updates = (
         int(config["TOTAL_TIMESTEPS"]) // config["NUM_STEPS"] // config["NUM_ENVS"]
@@ -513,10 +509,12 @@ def train(
         // config["NUM_ENVS"]
     )
 
-    rng, actor_rng, initial_test_metrics_rng, initial_env_state_rng = jax.random.split(
-        rng, 4
-    )
+    # rng (and actor_rng) are the same on all tasks and all nodes.
+    rng, actor_rng = jax.random.split(rng)
 
+    per_task_rng, test_env_base_rng, initial_env_state_rng = jax.random.split(
+        per_task_rng, 3
+    )
     eps_scheduler = optax.linear_schedule(
         config["EPS_START"],
         config["EPS_FINISH"],
@@ -542,51 +540,105 @@ def train(
         norm_input=config.get("NORM_INPUT", False),
         add_last_action=config.get("ADD_LAST_ACTION", False),  # True in config
     )
+    per_task_rng, network_init_rng, actor_base_rng = jax.random.split(per_task_rng, 3)
+
     train_state = create_agent(
-        actor_rng,
+        network_init_rng,
         env=env,
         env_params=env_params,
-        config=config,
+        max_grad_norm=config["MAX_GRAD_NORM"],
         network=network,
         lr=lr,
     )
 
+    # Replicate the training state on each device
+    train_state = jax.tree.map(
+        lambda x: jax.device_put(x, replicated_sharding), train_state
+    )
+
+    # note: `train_state` should be exactly the same on all tasks and all nodes.
+
+    # TODO: Change this into a scan that tests once every `some_fn_of(config["TEST_INTERVAL"])`
+    # updates instead.
+
+    # Playing around with `pmap` / `pmean`.
+
+    # test_metrics = jax.tree.map(
+    #     lambda v: jax.lax.all_gather(v, axis_name="devices"),
+    #     # lambda v: jax.lax.pmean(v, axis_name="devices"),
+    #     jax.pmap(
+    #         lambda state, env_key, actor_key: get_test_metrics(
+    #             state,
+    #             env_key,
+    #             actor_key,
+    #             network=network,
+    #             test_env=test_env,
+    #             env_params=env_params,
+    #             test_num_steps=config["TEST_NUM_STEPS"],
+    #             test_num_envs=config["TEST_NUM_ENVS"],
+    #             eps_test=config["EPS_TEST"],
+    #         ),
+    #         axis_name="devices",
+    #         devices=jax.local_devices(),
+    #     )(
+    #         flax.jax_utils.replicate(train_state, devices=jax.local_devices()),
+    #         flax.jax_utils.replicate(test_env_base_rng, devices=jax.local_devices()),
+    #         jax.random.split(rng, jax.local_device_count()),
+    #     ),
+    # )
+
+    @functools.partial(
+        jax.experimental.shard_map.shard_map,
+        mesh=mesh,
+        in_specs=(
+            PartitionSpec(),
+            PartitionSpec(),
+            PartitionSpec("batch"),
+        ),
+        out_specs=PartitionSpec("batch"),
+    )
+    def test(state, env_key, actor_key):
+        return get_test_metrics(
+            state,
+            env_key,
+            actor_key,
+            network=network,
+            test_env=test_env,
+            env_params=env_params,
+            test_num_steps=config["TEST_NUM_STEPS"],
+            test_num_envs=config["TEST_NUM_ENVS"],
+            eps_test=config["EPS_TEST"],
+        )
+
+    full_metrics2 = jax.jit(test)(
+        train_state,
+        jax.device_put(
+            test_env_base_rng, replicated_sharding
+        ),  # replicate on all devices
+        jax.device_put(
+            jax.random.split(actor_base_rng, jax.device_count()),
+            per_node_sharding,
+        ),  # shard per device.
+    )
+    test_metrics2 = jax.tree.map(
+        lambda v: jax.lax.pmean(v, axis_name="batch"), full_metrics2
+    )
+    assert isinstance(test_metrics2, dict)
+    assert False, test_metrics2
+
     # TRAINING LOOP
-    # todo: why test at the start?
-    test_metrics = get_test_metrics(
-        train_state,
-        initial_test_metrics_rng,
-        config=config,
-        network=network,
-        test_env=test_env,
-        env_params=env_params,
-    )
-    assert test_metrics is None or isinstance(test_metrics, dict)
-
-    # step randomly to have the initial memory window
-
-    # NOTE: `rng` was being overwritten anyway below, using it directly instead.
-    # rng, _rng = jax.random.split(rng)
-
-    # todo: Would be nice to be able to start from a checkpoint and maybe skip this step.
-    assert config["MEMORY_WINDOW"] == 0
-    # train
-    # NOTE: rng was just unused after this, so using it directly instead of splitting.
-    # rng, _rng = jax.random.split(rng)
-
     _initial_obs, _initial_env_state = env.reset(initial_env_state_rng, env_params)
-    expl_state = _ExplorationState(
-        hs=network.initialize_carry(num_envs),
-        obs=_initial_obs,
-        done=jnp.zeros((num_envs), dtype=bool),
-        action=jnp.zeros((num_envs), dtype=int),
-        env_state=_initial_env_state,
-    )
     runner_state = _RunnerState(
-        train_state,
-        expl_state,
-        test_metrics,
-        rng,  # was _rng
+        train_state=train_state,
+        expl_state=_ExplorationState(
+            hs=network.initialize_carry(num_envs),
+            obs=_initial_obs,
+            done=jnp.zeros((num_envs), dtype=bool),
+            action=jnp.zeros((num_envs), dtype=int),
+            env_state=_initial_env_state,
+        ),
+        test_metrics=test_metrics,
+        rng=rng,
     )
 
     # todo: Would be nice to be able restart from an existing
@@ -672,23 +724,25 @@ def random_step(
 @jit
 def get_test_metrics(
     train_state: CustomTrainState,
-    test_rng: chex.PRNGKey,
+    test_env_base_rng: chex.PRNGKey,
+    actor_base_rng: chex.PRNGKey,
     *,
-    config: Static[Config],
     network: Static[RNNQNetwork],
-    test_env: Static[BatchEnvWrapper],
+    test_env: Static[OptimisticResetVecEnvWrapper | BatchEnvWrapper],
     env_params: Static[EnvParams],
+    test_num_envs: Static[int],
+    test_num_steps: Static[int],
+    eps_test: float,
 ):
-    test_during_training = config.get("TEST_DURING_TRAINING", False)
-    test_num_envs: int = config["TEST_NUM_ENVS"]
-    test_num_steps: int = config["TEST_NUM_STEPS"]
-
-    if not test_during_training:
-        return None
+    # assert config["TEST_DURING_TRAINING"] # otherwise don't call this function!
+    # test_during_training = config.get("TEST_DURING_TRAINING", False)
+    # test_num_envs: int = config["TEST_NUM_ENVS"]
+    # test_num_steps: int = config["TEST_NUM_STEPS"]
+    # eps_test: float = config["EPS_TEST"]
 
     # note: `rng` was unused after this, so using the input (and renaming it to `test_env_rng` instead.)
     # rng, _test_rng = jax.random.split(rng)
-    init_obs, env_state = test_env.reset(test_rng, env_params)
+    init_obs, env_state = test_env.reset(test_env_base_rng, env_params)
     exploration_state = _ExplorationState(
         hs=network.initialize_carry(test_num_envs),  # (n_envs, hs_size)
         obs=init_obs,
@@ -699,17 +753,19 @@ def get_test_metrics(
 
     # We don't care about the resulting exploration state or modified rng here. (_)
     _, infos = jax.lax.scan(
-        lambda expl_state_and_rng, _step: _greedy_env_step(
-            expl_state_and_rng,
-            _step,
+        lambda exploration_state, step: _greedy_env_step(
+            exploration_state,
+            step,
+            actor_base_rng=actor_base_rng,
+            test_env_base_rng=test_env_base_rng,
+            test_num_envs=test_num_envs,
+            eps_test=eps_test,
             network=network,
             train_state=train_state,
-            config=config,
             test_env=test_env,
-            test_env_rng=test_rng,
             env_params=env_params,
         ),
-        (exploration_state, test_rng),
+        exploration_state,
         xs=jnp.arange(test_num_steps),  # None,
         length=test_num_steps,
         # desc="Testing...",
@@ -727,56 +783,66 @@ def get_test_metrics(
 
 @jit
 def _greedy_env_step(
-    step_state: tuple[_ExplorationState, chex.PRNGKey],
+    exploration_state: _ExplorationState,
     step: jax.Array,
+    actor_base_rng: chex.PRNGKey,
+    test_env_base_rng: chex.PRNGKey,
     *,
+    test_num_envs: Static[int],
+    eps_test: float,
     network: Static[RNNQNetwork],
     train_state: CustomTrainState,
-    config: Static[Config],
-    test_env: Static[GymnaxWrapper],
+    # config: Static[Config],
+    test_env: Static[OptimisticResetVecEnvWrapper | BatchEnvWrapper],
     env_params: Static[EnvParams],
-    test_env_rng: chex.PRNGKey,
 ):
-    test_num_envs: int = config["TEST_NUM_ENVS"]
-    eps_test: float = config["EPS_TEST"]
-
-    expl_state, rng = step_state
-    rng, action_rng = jax.random.split(rng, 2)
     # note: rng_s was unused.
     # rng, action_rng, rng_s = jax.random.split(rng, 3)
     # NOTE: Below this used to pass the same `test_env_rng` to test_env.step at every step.
     # Here instead I'm folding in the step.
-    test_env_step_rng = jax.random.fold_in(test_env_rng, step)
+    test_env_step_rng = jax.random.fold_in(test_env_base_rng, step)
+    actor_rng = jax.random.fold_in(actor_base_rng, step)
+    network_forward_pass_rng, action_selection_rng = jax.random.split(actor_rng, 2)
 
-    hs, last_obs, last_done, last_action, env_state = expl_state
+    hs, last_obs, last_done, last_action, env_state = exploration_state
 
     _obs = last_obs[np.newaxis]  # (1 (dummy time), num_envs, obs_size)
     _done = last_done[np.newaxis]  # (1 (dummy time), num_envs)
     _last_action = last_action[np.newaxis]  # (1 (dummy time), num_envs)
+
+    # (num_envs, hidden_size), (1, num_envs, num_actions)
     new_hs, q_vals = network.apply(
-        {
+        variables={
             "params": train_state.params,
             "batch_stats": train_state.batch_stats,
         },
-        hs,
-        _obs,
-        _done,
-        _last_action,
+        hidden=hs,
+        x=_obs,
+        done=_done,
+        last_action=_last_action,
         train=False,
-    )  # (num_envs, hidden_size), (1, num_envs, num_actions)
+        # not necessary apparently, since the network forward pass doesn't have any
+        # rng-dependent operations.
+        # rngs=network_forward_pass_rng,
+    )
     assert isinstance(q_vals, jax.Array)
     q_vals = q_vals.squeeze(axis=0)  # (num_envs, num_actions) remove the time dim
     eps = jnp.full(test_num_envs, eps_test)
     new_action = jax.vmap(eps_greedy_exploration)(
-        jax.random.split(action_rng, test_num_envs), q_vals, eps
+        jax.random.split(action_selection_rng, test_num_envs), q_vals, eps
     )
-    new_obs, new_env_state, reward, new_done, info = test_env.step(
+    # huh, why is the reward dropped here?
+    new_obs, new_env_state, _reward, new_done, info = test_env.step(
         test_env_step_rng, env_state, new_action, env_params
     )
     new_expl_state = _ExplorationState(
-        new_hs, new_obs, new_done, new_action, new_env_state
+        hs=new_hs,
+        obs=new_obs,
+        done=new_done,
+        action=new_action,
+        env_state=new_env_state,
     )
-    return (new_expl_state, rng), info
+    return new_expl_state, info
 
 
 @jit
@@ -785,10 +851,10 @@ def update_step(
     step: jax.Array,
     config: Static[Config],
     network: Static[RNNQNetwork],
-    env: Static[OptimisticResetVecEnvWrapper],
+    env: Static[OptimisticResetVecEnvWrapper | BatchEnvWrapper],
     env_params: Static[EnvParams],
     eps_scheduler: Static[optax.Schedule],
-    test_env: Static[BatchEnvWrapper],
+    test_env: Static[OptimisticResetVecEnvWrapper | BatchEnvWrapper],
 ):
     num_steps: int = config["NUM_STEPS"]  # steps per environment in each update
     num_envs: int = config["NUM_ENVS"]
@@ -833,8 +899,9 @@ def update_step(
     # update timesteps count
     train_state = dataclasses.replace(
         train_state,
-        n_updates=train_state.n_updates + 1,
         timesteps=train_state.timesteps + num_steps * num_envs,
+        # todo: don't understand this one here. one 'n_updates' is multiple 'updates'??
+        n_updates=train_state.n_updates + 1,
     )
 
     assert isinstance(loss, jax.Array)
@@ -936,7 +1003,7 @@ def collect_transitions_and_update_buffer(
         transition_buffer,
         _transitions,
     )
-    return exploration_state, rng, transition_buffer, infos
+    return exploration_state, transition_buffer, infos
 
 
 @jit
@@ -951,7 +1018,7 @@ def learn_epoch(
     gamma: float,
     lambda_: float,
     num_envs: Static[int],
-    env: Static[OptimisticResetVecEnvWrapper],
+    env: Static[OptimisticResetVecEnvWrapper | BatchEnvWrapper],
     env_params: Static[EnvParams],
     eps_scheduler: Static[optax.Schedule],
     reward_scaling_coefficient: float,
@@ -1164,7 +1231,7 @@ def preprocess_transition(
 
 
 def get_action_and_q_values(
-    hs: jax.Array,
+    hs: list[tuple[jax.Array, jax.Array]],
     obs: jax.Array,
     done: jax.Array,
     last_action: jax.Array,
@@ -1256,23 +1323,23 @@ def step_env(
 @jit
 def create_agent(
     rng: chex.PRNGKey,
-    env: Static[OptimisticResetVecEnvWrapper],
+    env: Static[OptimisticResetVecEnvWrapper | BatchEnvWrapper],
     env_params: Static[EnvParams],
-    config: Static[Config],
+    max_grad_norm: Static[float],
     network: Static[RNNQNetwork],
     lr: Static[float | jax.Array | optax.Schedule],
 ):
-    init_x = (
+    init_x = (  # (obs, dones, last_actions)
         jnp.zeros(
             (1, 1, *env.observation_space(env_params).shape)
-        ),  # (time_step, batch_size, obs_size)
+        ),  # (time_step, batch_size, *obs_size)
         jnp.zeros((1, 1)),  # (time_step, batch size)
         jnp.zeros((1, 1)),  # (time_step, batch size)
-    )  # (obs, dones, last_actions)
+    )
     init_hs = network.initialize_carry(1)  # (batch_size, hidden_dim)
     network_variables = network.init(rng, init_hs, *init_x, train=False)
     tx = optax.chain(
-        optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+        optax.clip_by_global_norm(max_grad_norm),
         optax.radam(learning_rate=lr),
     )
 
@@ -1340,11 +1407,21 @@ def setup_logging(local_rank: int, num_processes: int, verbose: int):
         assert verbose >= 3
         logger.setLevel(logging.DEBUG)
 
+    logging.getLogger("jax").setLevel(logging.DEBUG)
+
 
 @hydra.main(version_base=None, config_path="./config", config_name="pqn_rnn_craftax")
 def main(_config):
     dist_env = SlurmDistributedEnv()
-    setup_logging(dist_env.local_rank, dist_env.num_nodes, 2)
+    setup_logging(dist_env.local_rank, dist_env.num_tasks, 2)
+    task_gpus = list(range(dist_env.gpus_per_task))
+    # todo: adjust if we want to do one task per gpu.
+    jax_distributed_initialize(local_device_ids=task_gpus)
+
+    from craftax.craftax.envs.craftax_symbolic_env import (
+        CraftaxSymbolicEnv,
+        CraftaxSymbolicEnvNoAutoReset,
+    )
 
     _config = OmegaConf.to_container(_config)
     assert isinstance(_config, dict)
@@ -1357,15 +1434,7 @@ def main(_config):
 
     alg_name = config.get("ALG_NAME", "pqn_rnn")
     env_name = config["ENV_NAME"]
-    # task_gpus = list(
-    #     range(
-    #         distributed_env.local_rank * distributed_env.gpus_per_task,
-    #         (distributed_env.local_rank + 1) * distributed_env.gpus_per_task,
-    #     )
-    # )
-    task_gpus = list(range(dist_env.gpus_per_task))
-    # todo: adjust if we want to do one task per gpu.
-    jax_distributed_initialize(local_device_ids=task_gpus)
+
     logger.info(f"{jax.devices()=}, {jax.local_devices()=}")
     _run = wandb.init(
         entity=config["ENTITY"],
@@ -1382,17 +1451,47 @@ def main(_config):
         mode=config["WANDB_MODE"],
     )
 
-    rng = jax.random.PRNGKey(config["SEED"])
-
-    # jax.debug.visualize_array_sharding(rngs)
+    rng = jax.random.key(config["SEED"])
 
     # TODO: Look into `flax.jax_utils.replicate` and how it is used in the Stoix repo
     # https://github.com/EdanToledo/Stoix/blob/main/stoix/systems/q_learning/ff_qr_dqn.py
 
     # TODO: Add profiling hooks following https://docs.jax.dev/en/latest/profiling.html
-    train_fn = make_train(config)
+    config = copy.deepcopy(config)
+    config["NUM_UPDATES"] = (
+        int(config["TOTAL_TIMESTEPS"]) // config["NUM_STEPS"] // config["NUM_ENVS"]
+    )
+
+    config["NUM_UPDATES_DECAY"] = (
+        int(config["TOTAL_TIMESTEPS_DECAY"])
+        // config["NUM_STEPS"]
+        // config["NUM_ENVS"]
+    )
+
+    assert (config["NUM_STEPS"] * config["NUM_ENVS"]) % config[
+        "NUM_MINIBATCHES"
+    ] == 0, "NUM_MINIBATCHES must divide NUM_STEPS*NUM_ENVS"
+
+    # todo: Would like to remove this "optimistic resets" wrapper, since it would make the code much simpler
+    # and give us explicit control over the vmapping of step/reset.
+    basic_env = make_craftax_env_from_name(
+        config["ENV_NAME"], auto_reset=not config["USE_OPTIMISTIC_RESETS"]
+    )
+    assert isinstance(basic_env, CraftaxSymbolicEnv | CraftaxSymbolicEnvNoAutoReset)
+    env_params = basic_env.default_params
+
+    def train_fn(rng: jax.Array):
+        return train(
+            rng,
+            config=FrozenDict(config),  # type: ignore
+            basic_env=basic_env,
+            env_params=env_params,
+            # test_env=test_env,
+            dist_env=dist_env,
+        )
+
     logger.info("Starting to jit the training function.")
-    _start = time.time()
+
     # TODO: Disabling multiple seeds for now, to make it simpler to learn how to distribute
     # this across devices.
     # num_seeds = config["NUM_SEEDS"]
@@ -1401,29 +1500,13 @@ def main(_config):
 
     rngs = rng
 
-    # from jax.experimental.shard_map import shard_map
-    # from jax.sharding import PartitionSpec as P
-    # from jax.sharding import NamedSharding
-
-    # mesh = jax.make_mesh((dist_env.num_tasks * dist_env.gpus_per_task,), ("devices"))
-    # assert jax.device_count() == (dist_env.num_tasks * dist_env.gpus_per_task)
-
-    # train_fn = shard_map(
-    #     train_fn,
-    #     mesh=mesh,
-    #     in_specs=P("devices"),
-    #     out_specs=P(None),
-    # )
-    # rngs = jax.random.split(rng, (dist_env.num_tasks * dist_env.gpus_per_task))
-    # rngs = jax.device_put(rngs, NamedSharding(mesh, P("devices")))
-    # jax.debug.visualize_array_sharding(rngs)
-
-    train_fn = jax.jit(train_fn).lower(rngs).compile()
-    logger.info(f"Took {time.time() - _start} seconds to jit.")
+    # train_fn = jax.jit(train).lower(rngs).compile()
+    # logger.info(f"Took {time.time() - _start} seconds to jit.")
 
     _start = time.time()
     outs: Results = jax.block_until_ready(train_fn(rngs))
     logger.info(f"Took {time.time() - _start} seconds to complete.")
+
     print(jax.tree.map(jnp.shape, outs["metrics"]))
     print(
         *[
