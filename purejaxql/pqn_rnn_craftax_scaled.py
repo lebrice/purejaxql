@@ -79,6 +79,7 @@ if typing.TYPE_CHECKING:
     )
 else:
     EnvParams, EnvState = None, None
+    CraftaxSymbolicEnv, CraftaxSymbolicEnvNoAutoReset = None, None
 
 
 logger = logging.getLogger(__name__)
@@ -467,21 +468,60 @@ def scan_with_progress[
     )
 
 
+# jax.experimental.shard_map.shard_map(
+#     test,
+#     mesh=mesh,
+#     in_specs=(
+#         replicated,  # Replicate these on each
+#         replicated,  # Replicate these on each
+#         per_node,
+#     ),
+#     out_specs=PartitionSpec(),
+#     check_rep=False,  # get weird error with scan input / output sharding being different?
+# )
+def _test(
+    state: RunnerState,
+    env_key: jax.Array,
+    actor_key: jax.Array,
+    network: Static[RNNQNetwork],
+    test_env: Static[OptimisticResetVecEnvWrapper | BatchEnvWrapper],
+    env_params: Static[EnvParams],
+    test_num_steps: int,
+    test_num_envs: int,
+    eps_test: float,
+):
+    if actor_key.shape == (1,):
+        actor_key = actor_key[0]  # This is only true with shard_map?
+    metrics = get_test_metrics(
+        state.train_state,
+        env_key,
+        actor_key,
+        network=network,
+        test_env=test_env,
+        env_params=env_params,
+        test_num_steps=test_num_steps,
+        test_num_envs=test_num_envs,
+        eps_test=eps_test,
+    )
+    return jax.lax.pmean(metrics, axis_name="batch")
+
+
+per_node = PartitionSpec("batch")
+replicated = PartitionSpec()
+
+
 # @jit  # called once per node?
 def train(
     rng: chex.PRNGKey,  # global base rng (same on all nodes and tasks).
     config: Static[Config],
     basic_env: Static[CraftaxSymbolicEnv | CraftaxSymbolicEnvNoAutoReset],
     env_params: Static[EnvParams],
-    # dist_env: Static[SlurmDistributedEnv],
 ):
     num_envs: int = config["NUM_ENVS"]
     test_num_envs: int = config["TEST_NUM_ENVS"]
 
     # this way `per_node_rng` and `per_task_rng` are guaranteed to be different.
-    # per_node_rng = jax.random.fold_in(rng, jax.process_index())
-    per_task_rng = jax.random.fold_in(rng, jax.process_index())
-
+    # per_task_rng = jax.random.fold_in(rng, jax.process_index())
     mesh = jax.make_mesh(
         (jax.device_count(),),
         ("batch"),
@@ -494,11 +534,8 @@ def train(
     # axis_types = _get_axis_types(auto_axes=None, explicit_axes=None, manual_axes=None)
     # mesh = mesh_lib.Mesh(mesh_devices, axis_names=("batch",), axis_types=axis_types)
 
-    per_node = PartitionSpec("batch")
-    replicated = PartitionSpec()
-
-    per_node_sharding = NamedSharding(mesh, per_node)
-    replicated_sharding = NamedSharding(mesh, replicated)
+    # per_node_sharding = NamedSharding(mesh, per_node)
+    # replicated_sharding = NamedSharding(mesh, replicated)
 
     log_env = LogWrapper(basic_env)
 
@@ -524,12 +561,6 @@ def train(
     num_updates = int(config["TOTAL_TIMESTEPS"] / steps_per_update)
     num_updates_decay = int(config["TOTAL_TIMESTEPS_DECAY"] / steps_per_update)
 
-    # Network weights are initialized to the same value on all devices.
-    rng, network_init_rng = jax.random.split(rng)
-
-    per_task_rng, test_env_base_rng, initial_env_state_rng, actor_base_rng = (
-        jax.random.split(per_task_rng, 4)
-    )
     assert config["EPS_DECAY"] * num_updates_decay > 0
     eps_scheduler = optax.linear_schedule(
         config["EPS_START"],
@@ -557,10 +588,6 @@ def train(
         add_last_action=config.get("ADD_LAST_ACTION", False),  # True in config
     )
 
-    # Replicate the training state on each device
-    # todo: check if the tree_map is necessary (might apply to pytrees also)
-    # train_state = jax.device_put(train_state, replicated_sharding)
-
     # note: `train_state` should be exactly the same on all tasks and all nodes.
 
     # TODO: Change this into a scan that tests once every `some_fn_of(config["TEST_INTERVAL"])`
@@ -568,62 +595,28 @@ def train(
 
     # Playing around with `pmap` / `pmean`.
 
-    @functools.partial(
-        jax.experimental.shard_map.shard_map,
-        mesh=mesh,
-        in_specs=(
-            replicated,  # Replicate these on each
-            replicated,  # Replicate these on each
-            per_node,
-        ),
-        out_specs=PartitionSpec(),
-        check_rep=False,  # get weird error with scan input / output sharding being different?
-    )
-    def test(state: RunnerState, env_key: jax.Array, actor_key: jax.Array):
-        metrics = get_test_metrics(
-            state.train_state,
-            env_key,
-            actor_key[0],  # bug: seems necessary for some reason? Why?
-            network=network,
-            test_env=test_env,
-            env_params=env_params,
-            test_num_steps=config["TEST_NUM_STEPS"],
-            test_num_envs=config["TEST_NUM_ENVS"],
-            eps_test=config["EPS_TEST"],
-        )
-        return jax.lax.pmean(metrics, axis_name="batch")
-
-    # Different for each GPU
-    actor_base_rngs = jax.random.split(actor_base_rng, jax.device_count())
-    start_t = time.time()
-    test_metrics = jax.block_until_ready(
-        jax.jit(test)(_train_state, test_env_base_rng, actor_base_rngs)
-    )
-    logger.info(f"Finished initial test phase in {time.time() - start_t} seconds.")
-    logger.info(f"Initial test metrics: {test_metrics}")
-    return
     # TRAINING LOOP
     # todo: potentially resume this by loading this initial state from a file.
-    current_update = 0
 
-    _train_state = create_agent(
-        network_init_rng,
-        env=env,
-        env_params=env_params,
-        max_grad_norm=config["MAX_GRAD_NORM"],
-        network=network,
-        lr=lr,
-    )
+    current_update = 0
     runner_state = initial_state(
         rng,
         env_params=env_params,
         env=env,
         num_envs=num_envs,
-        initial_env_state_rng=initial_env_state_rng,
         network=network,
-        train_state=_train_state,
-        test_metrics=test_metrics,
+        max_grad_norm=config["MAX_GRAD_NORM"],
+        lr=lr,
+        test_env=test_env,
+        test_num_envs=test_num_envs,
+        test_num_steps=config["TEST_NUM_STEPS"],
+        eps_test=config["EPS_TEST"],
     )
+    logger.info(f"Initial test metrics: {runner_state.test_metrics}")
+
+    # Replicate the training state on each device.
+    # TODO: Unclear, should we use this? Or use shard_map? or pmap?
+    # runner_state = flax.jax_utils.replicate(runner_state)
 
     @functools.partial(
         jax.experimental.shard_map.shard_map,
@@ -635,8 +628,8 @@ def train(
         out_specs=replicated,
         check_rep=False,  # get weird error with scan input / output sharding being different?
     )
-    def train_epoch(runner_state, update):
-        return update_step(
+    def train_epoch(runner_state: RunnerState, update: jax.Array):
+        new_state, metrics = update_step(
             runner_state,
             update,
             config=config,
@@ -646,13 +639,16 @@ def train(
             eps_scheduler=eps_scheduler,
             test_env=test_env,
         )
+        jax.experimental.io_callback(wandb.log, metrics)
+        # todo: also occasionally run test and log those metrics as well.
+        return new_state, metrics
 
     # todo: Would be nice to be able restart from an existing
     # checkpoint by changing this to a jax.lax.fori_loop of some sort instead of a scan!
     jax.debug.print("Starting training loop")
     runner_state, metrics = scan_with_progress(
         train_epoch,
-        init=initial_state,
+        init=runner_state,
         xs=jnp.arange(current_update, num_updates),
         length=num_updates - current_update,
         desc="Training...",
@@ -661,19 +657,48 @@ def train(
     return Results(runner_state=runner_state, metrics=metrics)
 
 
+@jit
 def initial_state(
-    rng: jax.Array,
-    env_params: EnvParams,
-    env: BatchEnvWrapper | OptimisticResetVecEnvWrapper,
+    rng: chex.PRNGKey,
+    env_params: Static[EnvParams],
+    env: Static[BatchEnvWrapper | OptimisticResetVecEnvWrapper],
+    test_env: Static[BatchEnvWrapper | OptimisticResetVecEnvWrapper],
     num_envs: Static[int],
-    initial_env_state_rng: chex.PRNGKey,
     network: Static[RNNQNetwork],
-    train_state: CustomTrainState,
-    test_metrics: dict[str, jax.Array],
+    max_grad_norm: Static[float],
+    lr: Static[optax.Schedule | float],
+    test_num_envs: Static[int],
+    test_num_steps: Static[int],
+    eps_test: Static[float],
 ):
-    _initial_obs, _initial_env_state = env.reset(initial_env_state_rng, env_params)
+    # Network weights are initialized to the same value on all devices.
+    network_init_rng, env_key, actor_key = jax.random.split(rng, 3)
+    _train_state = create_agent(
+        network_init_rng,
+        env=env,
+        env_params=env_params,
+        max_grad_norm=max_grad_norm,
+        network=network,
+        lr=lr,
+    )
+    # Get the test metrics as the average of metrics on each device, with a different
+    # RNG for action selection in the actor.
+    _initial_obs, _initial_env_state = env.reset(env_key, env_params)
+
+    # distributed_test = jax.experimental.shard_map.shard_map(
+    #     test,
+    #     mesh=mesh,
+    #     in_specs=(
+    #         replicated,  # Replicate these on each
+    #         replicated,  # Replicate these on each
+    #         per_node,
+    #     ),
+    #     out_specs=PartitionSpec(),
+    #     check_rep=False,  # get weird error with scan input / output sharding being different?
+    # )
+
     return RunnerState(
-        train_state=train_state,
+        train_state=_train_state,
         expl_state=_ExplorationState(
             hs=network.initialize_carry(num_envs),
             obs=_initial_obs,
@@ -681,7 +706,17 @@ def initial_state(
             action=jnp.zeros((num_envs), dtype=int),
             env_state=_initial_env_state,
         ),
-        test_metrics=test_metrics,
+        test_metrics=get_test_metrics(
+            _train_state,
+            env_key,
+            actor_key,
+            network=network,
+            test_env=test_env,
+            env_params=env_params,
+            test_num_steps=test_num_steps,
+            test_num_envs=test_num_envs,
+            eps_test=eps_test,
+        ),
         rng=rng,
     )
 
@@ -1138,17 +1173,16 @@ def update_network(
         has_aux=True,
     )(train_state.params)
 
-    # TODO: Rearrange this whole thing to be simpler, like in Stoix repo.
-    grads = jax.lax.pmean(grads, axis_name="devices")
+    grads = jax.lax.pmean(grads, axis_name="batch")
     # todo: would we also need to sync the batch stats here?
-    # updates["batch_stats"] = jax.lax.pmean(updates["batch_stats"], axis_name="devices")
+    batch_stats = jax.lax.pmean(updates["batch_stats"], axis_name="batch")
     # TODO: this increases `train_state.step` by 1, but we also increase it manually elsewhere!
     # TODO: Idea: How about syncing (pmean) between devices on the same node after each update here,
     # and then syncing after each "epoch" between nodes? Would that make sense?
     train_state = train_state.apply_gradients(grads=grads)
     train_state = train_state.replace(
         grad_steps=train_state.grad_steps + 1,
-        batch_stats=updates["batch_stats"],
+        batch_stats=batch_stats,
     )
     return train_state, (loss, qvals)
 
@@ -1282,14 +1316,13 @@ def get_action_and_q_values(
     q_vals = q_vals.squeeze(axis=0)  # (num_envs, num_actions) remove the time dim
 
     # TODO: Instead of using this manually-created `n_updates` from the train_state, and having
-    # to setup the scheduler with
+    # to setup the scheduler with this divider, we could instead use the env steps as the
     #
     # optax.linear_schedule(
     #     config["EPS_START"],
     #     config["EPS_FINISH"],
     #     (config["EPS_DECAY"]) * num_updates_decay,
     # )
-    jax.debug.print(train_state.step)
     # num_updates_decay = (int(config["TOTAL_TIMESTEPS_DECAY"])
     #     // config["NUM_STEPS"]
     #     // config["NUM_ENVS"]
@@ -1526,8 +1559,6 @@ def main(_config):
             config=FrozenDict(config),  # type: ignore
             basic_env=basic_env,
             env_params=env_params,
-            # test_env=test_env,
-            # dist_env=dist_env,
         )
 
     # TODO: Disabling multiple seeds for now, to make it simpler to learn how to distribute
@@ -1536,13 +1567,18 @@ def main(_config):
     # rngs = jax.random.split(rng, num_seeds)
     # train_fn = jax.jit(jax.vmap(train_fn, axis_name="seeds")).lower(rngs).compile()
 
-    rngs = rng
-
     # train_fn = jax.jit(train).lower(rngs).compile()
     # logger.info(f"Took {time.time() - _start} seconds to jit.")
 
     _start = time.time()
-    outs: Results = jax.block_until_ready(train_fn(rngs))
+    outs: Results = jax.block_until_ready(
+        train(
+            rng,
+            config=FrozenDict(config),  # type: ignore
+            basic_env=basic_env,
+            env_params=env_params,
+        )
+    )
     logger.info(f"Took {time.time() - _start} seconds to complete.")
 
     print(jax.tree.map(jnp.shape, outs["metrics"]))
@@ -1569,7 +1605,7 @@ def main(_config):
             ),
         )
 
-        for i, rng in enumerate(rngs):
+        for i, rng in enumerate([rng]):
             params = jax.tree.map(lambda x: x[i], model_state.params)
             save_path = os.path.join(
                 save_dir,
