@@ -10,6 +10,7 @@ JAX_TRACEBACK_FILTERING=off srun --pty --nodes=1 --ntasks-per-node=1 --gpus-per-
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import os
 import time
@@ -519,7 +520,7 @@ def train(
 
     steps_per_update = config["NUM_STEPS"] * num_envs
 
-    # todo: this is weird and messed up, fix this later where the schedulers are used.
+    # todo: this is weird, fix this later where the schedulers are used.
     num_updates = int(config["TOTAL_TIMESTEPS"] / steps_per_update)
     num_updates_decay = int(config["TOTAL_TIMESTEPS_DECAY"] / steps_per_update)
 
@@ -556,15 +557,6 @@ def train(
         add_last_action=config.get("ADD_LAST_ACTION", False),  # True in config
     )
 
-    train_state = create_agent(
-        network_init_rng,
-        env=env,
-        env_params=env_params,
-        max_grad_norm=config["MAX_GRAD_NORM"],
-        network=network,
-        lr=lr,
-    )
-
     # Replicate the training state on each device
     # todo: check if the tree_map is necessary (might apply to pytrees also)
     # train_state = jax.device_put(train_state, replicated_sharding)
@@ -576,20 +568,20 @@ def train(
 
     # Playing around with `pmap` / `pmean`.
 
-    # @functools.partial(
-    #     jax.experimental.shard_map.shard_map,
-    #     mesh=mesh,
-    #     in_specs=(
-    #         replicated,  # Replicate these on each
-    #         replicated,  # Replicate these on each
-    #         per_node,
-    #     ),
-    #     out_specs=PartitionSpec(),
-    #     # check_rep=False,
-    # )
-    def test(state: CustomTrainState, env_key: jax.Array, actor_key: jax.Array):
+    @functools.partial(
+        jax.experimental.shard_map.shard_map,
+        mesh=mesh,
+        in_specs=(
+            replicated,  # Replicate these on each
+            replicated,  # Replicate these on each
+            per_node,
+        ),
+        out_specs=PartitionSpec(),
+        check_rep=False,  # get weird error with scan input / output sharding being different?
+    )
+    def test(state: RunnerState, env_key: jax.Array, actor_key: jax.Array):
         metrics = get_test_metrics(
-            state,
+            state.train_state,
             env_key,
             actor_key[0],  # bug: seems necessary for some reason? Why?
             network=network,
@@ -603,40 +595,48 @@ def train(
 
     # Different for each GPU
     actor_base_rngs = jax.random.split(actor_base_rng, jax.device_count())
-    train_state = jax.device_put(train_state, NamedSharding(mesh, replicated))
-    test_env_base_rng = jax.device_put(
-        test_env_base_rng, NamedSharding(mesh, replicated)
-    )
-    actor_base_rng = jax.device_put(actor_base_rng, NamedSharding(mesh, per_node))
-
     start_t = time.time()
     test_metrics = jax.block_until_ready(
-        jax.jit(test)(train_state, test_env_base_rng, actor_base_rngs)
+        jax.jit(test)(_train_state, test_env_base_rng, actor_base_rngs)
     )
     logger.info(f"Finished initial test phase in {time.time() - start_t} seconds.")
     logger.info(f"Initial test metrics: {test_metrics}")
-    jax.debug.print("{}: {}", jax.process_index(), test_metrics)
     return
-
     # TRAINING LOOP
     # todo: potentially resume this by loading this initial state from a file.
     current_update = 0
+
+    _train_state = create_agent(
+        network_init_rng,
+        env=env,
+        env_params=env_params,
+        max_grad_norm=config["MAX_GRAD_NORM"],
+        network=network,
+        lr=lr,
+    )
     runner_state = initial_state(
         rng,
-        initial_env_state_rng=initial_env_state_rng,
         env_params=env_params,
         env=env,
         num_envs=num_envs,
+        initial_env_state_rng=initial_env_state_rng,
         network=network,
-        train_state=train_state,
+        train_state=_train_state,
         test_metrics=test_metrics,
     )
 
-    # todo: Would be nice to be able restart from an existing
-    # checkpoint by changing this to a jax.lax.fori_loop of some sort instead of a scan!
-    jax.debug.print("Starting training loop")
-    runner_state, metrics = scan_with_progress(
-        lambda runner_state, update: update_step(
+    @functools.partial(
+        jax.experimental.shard_map.shard_map,
+        mesh=mesh,
+        in_specs=(
+            replicated,  # Replicate these on each
+            replicated,  # Replicate these on each
+        ),
+        out_specs=replicated,
+        check_rep=False,  # get weird error with scan input / output sharding being different?
+    )
+    def train_epoch(runner_state, update):
+        return update_step(
             runner_state,
             update,
             config=config,
@@ -645,8 +645,14 @@ def train(
             env_params=env_params,
             eps_scheduler=eps_scheduler,
             test_env=test_env,
-        ),
-        init=runner_state,
+        )
+
+    # todo: Would be nice to be able restart from an existing
+    # checkpoint by changing this to a jax.lax.fori_loop of some sort instead of a scan!
+    jax.debug.print("Starting training loop")
+    runner_state, metrics = scan_with_progress(
+        train_epoch,
+        init=initial_state,
         xs=jnp.arange(current_update, num_updates),
         length=num_updates - current_update,
         desc="Training...",
@@ -1435,7 +1441,13 @@ def setup_logging(local_rank: int, num_processes: int, verbose: int):
         assert verbose >= 3
         logger.setLevel(logging.DEBUG)
 
-    logging.getLogger("jax").setLevel(logging.INFO if verbose == 2 else logging.DEBUG)
+    logging.getLogger("jax").setLevel(
+        logging.DEBUG
+        if verbose == 3
+        else logging.INFO
+        if verbose == 2
+        else logging.WARNING
+    )
 
 
 @hydra.main(version_base=None, config_path="./config", config_name="pqn_rnn_craftax")
