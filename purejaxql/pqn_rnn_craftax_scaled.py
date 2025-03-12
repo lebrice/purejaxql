@@ -468,42 +468,50 @@ def scan_with_progress[
     )
 
 
-# jax.experimental.shard_map.shard_map(
-#     test,
-#     mesh=mesh,
-#     in_specs=(
-#         replicated,  # Replicate these on each
-#         replicated,  # Replicate these on each
-#         per_node,
-#     ),
-#     out_specs=PartitionSpec(),
-#     check_rep=False,  # get weird error with scan input / output sharding being different?
-# )
-def _test(
-    state: RunnerState,
-    env_key: jax.Array,
-    actor_key: jax.Array,
+def get_distributed_testing_fn(
+    mesh: Mesh,
     network: Static[RNNQNetwork],
     test_env: Static[OptimisticResetVecEnvWrapper | BatchEnvWrapper],
     env_params: Static[EnvParams],
-    test_num_steps: int,
+    total_test_steps: int,
     test_num_envs: int,
     eps_test: float,
 ):
-    if actor_key.shape == (1,):
-        actor_key = actor_key[0]  # This is only true with shard_map?
-    metrics = get_test_metrics(
-        state.train_state,
-        env_key,
-        actor_key,
-        network=network,
-        test_env=test_env,
-        env_params=env_params,
-        test_num_steps=test_num_steps,
-        test_num_envs=test_num_envs,
-        eps_test=eps_test,
+    @functools.partial(
+        jax.experimental.shard_map.shard_map,
+        mesh=mesh,
+        in_specs=(
+            replicated,  # Replicate these on each
+            replicated,  # Replicate these on each
+            per_node,
+        ),
+        out_specs=PartitionSpec(),
+        check_rep=False,  # get weird error with scan input / output sharding being different?
     )
-    return jax.lax.pmean(metrics, axis_name="batch")
+    def _distributed_test(
+        train_state: CustomTrainState, env_key: jax.Array, actor_key: jax.Array
+    ) -> dict[str, jax.Array]:
+        if actor_key.shape == (1,):
+            actor_key = actor_key[0]  # This is only true with shard_map?
+        # todo: Check Craftax, it might be necessary to set a minimum number of steps
+        # so that at least an episode is done per device, or something similar?
+        test_steps_per_device = total_test_steps // mesh.devices.size
+
+        metrics = get_test_metrics(
+            train_state,
+            env_key,
+            actor_key,
+            network=network,
+            test_env=test_env,
+            env_params=env_params,
+            test_num_steps=test_steps_per_device,
+            test_num_envs=test_num_envs,
+            eps_test=eps_test,
+        )
+        mean_metrics = jax.lax.pmean(metrics, axis_name="batch")
+        return mean_metrics
+
+    return _distributed_test
 
 
 per_node = PartitionSpec("batch")
@@ -611,6 +619,8 @@ def train(
         test_num_envs=test_num_envs,
         test_num_steps=config["TEST_NUM_STEPS"],
         eps_test=config["EPS_TEST"],
+        with_initial_test_metrics=False,
+        mesh=mesh,
     )
     logger.info(f"Initial test metrics: {runner_state.test_metrics}")
 
@@ -639,19 +649,20 @@ def train(
             eps_scheduler=eps_scheduler,
             test_env=test_env,
         )
-        jax.experimental.io_callback(wandb.log, metrics)
+        jax.debug.print("Update {} metrics: {}", update, metrics)
+        jax.debug.callback(wandb.log, metrics)
         # todo: also occasionally run test and log those metrics as well.
         return new_state, metrics
 
     # todo: Would be nice to be able restart from an existing
     # checkpoint by changing this to a jax.lax.fori_loop of some sort instead of a scan!
     jax.debug.print("Starting training loop")
-    runner_state, metrics = scan_with_progress(
-        train_epoch,
+    runner_state, metrics = jax.lax.scan(
+        jax.jit(train_epoch),
         init=runner_state,
         xs=jnp.arange(current_update, num_updates),
         length=num_updates - current_update,
-        desc="Training...",
+        # desc="Training...",
     )
 
     return Results(runner_state=runner_state, metrics=metrics)
@@ -670,6 +681,8 @@ def initial_state(
     test_num_envs: Static[int],
     test_num_steps: Static[int],
     eps_test: Static[float],
+    with_initial_test_metrics: Static[bool],
+    mesh: Static[Mesh],
 ):
     # Network weights are initialized to the same value on all devices.
     network_init_rng, env_key, actor_key = jax.random.split(rng, 3)
@@ -685,18 +698,20 @@ def initial_state(
     # RNG for action selection in the actor.
     _initial_obs, _initial_env_state = env.reset(env_key, env_params)
 
-    # distributed_test = jax.experimental.shard_map.shard_map(
-    #     test,
-    #     mesh=mesh,
-    #     in_specs=(
-    #         replicated,  # Replicate these on each
-    #         replicated,  # Replicate these on each
-    #         per_node,
-    #     ),
-    #     out_specs=PartitionSpec(),
-    #     check_rep=False,  # get weird error with scan input / output sharding being different?
-    # )
-
+    if with_initial_test_metrics:
+        actor_keys = jax.random.split(rng, jax.device_count())
+        distributed_test_fn = get_distributed_testing_fn(
+            mesh=mesh,
+            network=network,
+            test_env=test_env,
+            env_params=env_params,
+            total_test_steps=test_num_steps,
+            test_num_envs=test_num_envs,
+            eps_test=eps_test,
+        )
+        test_metrics = distributed_test_fn(_train_state, env_key, actor_keys)
+    else:
+        test_metrics = {}
     return RunnerState(
         train_state=_train_state,
         expl_state=_ExplorationState(
@@ -706,17 +721,7 @@ def initial_state(
             action=jnp.zeros((num_envs), dtype=int),
             env_state=_initial_env_state,
         ),
-        test_metrics=get_test_metrics(
-            _train_state,
-            env_key,
-            actor_key,
-            network=network,
-            test_env=test_env,
-            env_params=env_params,
-            test_num_steps=test_num_steps,
-            test_num_envs=test_num_envs,
-            eps_test=eps_test,
-        ),
+        test_metrics=test_metrics,
         rng=rng,
     )
 
