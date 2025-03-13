@@ -140,6 +140,27 @@ wheels = [
 ]
 
 [[package]]
+name = "clu"
+version = "0.0.12"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "absl-py" },
+    { name = "etils", extra = ["epath"] },
+    { name = "flax" },
+    { name = "jax" },
+    { name = "jaxlib" },
+    { name = "ml-collections" },
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "typing-extensions" },
+    { name = "wrapt" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/77/b2/09a9ab02dc856b2edff2085259c2fe6830b728f5a78e89ffaa2a763002cc/clu-0.0.12.tar.gz", hash = "sha256:f71eaa1afbd30f57f7709257ba7e1feb8ad5c1c3dcae3606672a138678bb3ce4", size = 72670 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/08/04/8651aacf8a55b1cd46f620e629c6c1658181dacb684b5a09aadda32ff11d/clu-0.0.12-py3-none-any.whl", hash = "sha256:0d183e7d25f7dd0700444510a264e24700e2f068bdabd199ed22866f7e54edba", size = 101825 },
+]
+
+[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -842,6 +863,20 @@ wheels = [
 ]
 
 [[package]]
+name = "ml-collections"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "absl-py" },
+    { name = "pyyaml" },
+    { name = "six" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/31/f9/74689ff3e3ff6e4ec8616887cb00c9c66bca7e6243fd328358ea3665d547/ml_collections-1.0.0.tar.gz", hash = "sha256:00b11a1a339dd6c2d9b7f0daab47ab17e10e29ca1b2a656058605e2b7210897f", size = 61151 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5b/3c/2663b8b41a6f7dae1f1058cc75d9b1d09cf58e6482cb562976d4babe483c/ml_collections-1.0.0-py3-none-any.whl", hash = "sha256:17dbca4d83aba64f56b4b96e59637026d99d9e922569118b8a7f2e0ca6d203a6", size = 76451 },
+]
+
+[[package]]
 name = "ml-dtypes"
 version = "0.5.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1323,6 +1358,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "chex" },
+    { name = "clu" },
     { name = "craftax" },
     { name = "flax" },
     { name = "gym" },
@@ -1354,6 +1390,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "chex", specifier = ">=0.1.86" },
+    { name = "clu", specifier = ">=0.0.12" },
     { name = "craftax", specifier = ">=1.4.5" },
     { name = "envpool", marker = "extra == 'atari'", specifier = ">=0.8.4" },
     { name = "flax", specifier = ">=0.10.4" },
